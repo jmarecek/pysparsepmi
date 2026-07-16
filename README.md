@@ -1,0 +1,151 @@
+# pysparsepmi
+
+Sparse sum-of-squares (SOS) relaxations for **polynomial matrix inequalities
+(PMIs)**, exploiting chordal sparsity. A Python port of:
+
+- the modified **`sos.csp` option of YALMIP** from
+  [aeroimperial-optimization/sos-chordal-decomposition-pmi](https://github.com/aeroimperial-optimization/sos-chordal-decomposition-pmi),
+  which implements Zheng & Fantuzzi, *Sum-of-squares chordal decomposition of
+  polynomial matrix inequalities* ([arXiv:2007.11410](https://arxiv.org/abs/2007.11410)),
+  including its `corrsparsity.m` and `cliquesFromSpMatD.m` (SparseCoLO) routines;
+- the polynomial matrix optimization functionality demonstrated in
+  [TSSOS](https://github.com/wangjie212/TSSOS)'s `example/pmi.jl` (Julia).
+
+The modelling layer is deliberately close to
+[CVXPY's LMI API](https://www.cvxpy.org/api_reference/cvxpy.constraints.html#psd):
+you build polynomial matrices, write `P >> 0`, and solve with a `Problem`
+object that wraps `cvxpy.Problem`. Objectives and free parameters are plain
+CVXPY expressions/variables.
+
+## What it does
+
+A symmetric polynomial matrix `P(x)` with a **chordal sparsity pattern** whose
+maximal cliques are `C_1, ..., C_t` is certified positive semidefinite through
+the decomposition
+
+```
+(x'x)^nu * P(x) = sum_k  E_k' S_k(x) E_k,        S_k SOS matrices on the cliques,
+```
+
+so instead of one Gram matrix of size `m * |basis|` you get one small PSD
+block per clique (Theorem 3.4 of the paper; `nu = 0` by default). For scalar
+polynomials, `p >> 0` splits the Gram basis over the maximal cliques of the
+**correlative sparsity pattern** of the variables — exactly what
+`sdpsettings('sos.csp', 1)` does in YALMIP.
+
+Everything compiles to a standard SDP solved by any CVXPY-supported conic
+solver (SCS by default; MOSEK works if installed).
+
+## Installation
+
+```bash
+pip install numpy cvxpy      # dependencies
+pip install -e .             # from this directory
+```
+
+## Quick start
+
+### LMI-style SOS matrix constraints
+
+```python
+import cvxpy as cp
+import pysparsepmi as psp
+
+x, = psp.polyvar(1)                       # polynomial variables x0
+t = cp.Variable()                         # ordinary CVXPY decision variable
+
+F = psp.PolyMatrix([[1 + x**2, x],
+                    [x,        1]])
+
+# largest t such that F(x) - t*I admits a (chordally decomposed) SOS certificate
+prob = psp.Problem(cp.Maximize(t), [F - psp.eye(2, nvars=1) * t >> 0])
+prob.solve(solver="SCS")
+print(prob.value)
+```
+
+`P >> 0` / `P << Q` return `SOSMatrix` constraint objects; use the class
+directly for options:
+
+```python
+con = psp.SOSMatrix(P, sparse=True, nu=1)   # (x'x)^nu weight, clique blocks
+psp.Problem(None, [con]).solve()
+con.cliques, con.block_sizes                # inspect the decomposition
+```
+
+> **Note** — keep polynomials on the *left* of products with CVXPY scalars
+> (`x * t`, `psp.eye(2, 1) * t`): CVXPY does not know how to multiply its
+> expressions by `Polynomial` objects from the left.
+
+### Scalar SOS with correlative sparsity (YALMIP `sos.csp`)
+
+```python
+x = psp.polyvar(4)
+p = (x[0]*x[1] - 1)**2 + (x[1]*x[2] - 1)**2 + (x[2]*x[3] - 1)**2
+con = p >> 0                                # SOS constraint, csp-split basis
+psp.Problem(None, [con]).solve()
+print(con.cliques)                          # [[0, 1], [1, 2], [2, 3]]
+```
+
+### PMI optimization (TSSOS style)
+
+Lower-bound `inf_x lambda_min(F(x))` over a semialgebraic set defined by
+scalar and/or matrix inequalities, via a sparse Scherer–Hol certificate:
+
+```python
+x1, x2 = psp.polyvar(2)
+F = psp.PolyMatrix([[1 + x1**2, x1], [x1, 1]])
+G = psp.PolyMatrix([[x1*x2*(-4.0) + 1, x1], [x1, 4 - x1**2 - x2**2]])
+
+res = psp.pmi_optimize(F, ineqs=[G, 1 - x2**2], order=2)
+print(res.value, res.cliques, res.block_sizes)
+```
+
+For scalar polynomial optimization with constraints (sparse Lasserre / Waki
+et al.), use `psp.sos_lower_bound(f, ineqs=[...], order=d)`.
+
+## API summary
+
+| pysparsepmi | YALMIP / MATLAB | TSSOS (Julia) |
+|---|---|---|
+| `polyvar(n)` | `sdpvar x y ...` | `@polyvar x[1:n]` |
+| `PolyMatrix([[...]])`, `eye(m, nvars)` | matrix of `sdpvar` polys | `Matrix{Poly}` |
+| `p >> 0`, `SOS(p, sparse=True)` | `sos(p)` + `sdpsettings('sos.csp',1)` | — |
+| `P >> 0`, `SOSMatrix(P, sparse=True, nu=...)` | scalarized `u'*P*u` + `sos.csp` | — |
+| `Problem(cp.Maximize(t), cons).solve()` | `solvesos(CNSTR, -t, opts, params)` | — |
+| `pmi_optimize(F, ineqs, order=d)` | — | `tssos(F, G, x, d, TS=false)` |
+| `sos_lower_bound(f, ineqs, order=d)` | `solvesos` + `sos.csp` | `cs_tssos(f, g, x, d)` (CS only) |
+| `chordal_cliques(pattern)` | `cliquesFromSpMatD.m` | `clique_decomp` |
+| `correlative_sparsity(polys)` | `corrsparsity.m` | — |
+
+Low-level building blocks: `sos_poly_variable` / `sos_matrix_variable` create
+Gram-parameterized SOS multipliers, `monomials`, `gram_candidates`,
+`reduce_bases` handle basis generation and Newton-style reduction.
+
+**Scope notes.** This package implements *correlative/matrix* (clique)
+sparsity — the `sos.csp` functionality — not TSSOS's *term* sparsity
+(`TS="block"`/`"MD"`), and provides bounds only (no moment-side solution
+extraction).
+
+## Examples
+
+- `examples/tssos_pmi.py` — the first two problems of TSSOS `example/pmi.jl`
+  (the first bound, −4.0, is exact).
+- `examples/banded_pmi.py` — banded parametric PMI in the style of Example
+  5.1 of Zheng & Fantuzzi, comparing sparse clique blocks against the dense
+  certificate.
+- `examples/sparse_pop.py` — chained scalar polynomial optimization with
+  correlative sparsity (20 variables, cliques of size 2).
+
+Run the tests with `python tests/test_pysparsepmi.py` (or `pytest`).
+
+## References
+
+1. Y. Zheng, G. Fantuzzi (2020). Sum-of-squares chordal decomposition of
+   polynomial matrix inequalities. arXiv:2007.11410.
+2. H. Waki, S. Kim, M. Kojima, M. Muramatsu (2006). Sums of squares and
+   semidefinite program relaxations for polynomial optimization problems with
+   structured sparsity. SIAM J. Optim. 17(1).
+3. C. W. Scherer, C. W. J. Hol (2006). Matrix sum-of-squares relaxations for
+   robust semi-definite programs. Math. Program. 107.
+4. J. Wang, V. Magron, J.-B. Lasserre — TSSOS,
+   https://github.com/wangjie212/TSSOS.

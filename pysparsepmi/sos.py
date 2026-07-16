@@ -44,6 +44,7 @@ from .polynomial import (
 )
 from .chordal import chordal_cliques, correlative_sparsity
 from .basis import gram_candidates, reduce_bases
+from .termsparsity import ts_matrix_blocks
 
 __all__ = [
     "PolyMatrix",
@@ -202,19 +203,30 @@ class SOS:
     the behaviour of YALMIP's ``sos.csp`` option. ``cliques`` overrides the
     automatic clique detection (a list of iterables of variable indices).
 
+    ``ts`` additionally imposes term sparsity (TSSOS; Miller, Wang & Guo,
+    arXiv:2411.15479) on each Gram matrix: ``"block"`` uses the block
+    closure of the term sparsity pattern graph, ``"MD"`` a greedy
+    minimum-degree chordal closure, and each clique of the stabilized graph
+    becomes one small PSD block. ``ts_order`` is the sparse order ``s``
+    (number of support-extension steps; ``None`` iterates to stabilization,
+    matching repeated ``tssos(data, TS=...)`` calls).
+
     After the enclosing :class:`Problem` is compiled, the attributes
-    ``cliques``, ``bases``, ``grams`` and ``block_sizes`` describe the
-    decomposition.
+    ``cliques``, ``bases``, ``grams``, ``blocks`` and ``block_sizes``
+    describe the decomposition.
     """
 
-    def __init__(self, poly, sparse=True, cliques=None):
+    def __init__(self, poly, sparse=True, cliques=None, ts=None, ts_order=None):
         if isinstance(poly, PolyMatrix):
             raise TypeError("use SOSMatrix (or P >> 0) for polynomial matrices")
         self.poly = poly
         self.sparse = bool(sparse)
         self.cliques = None if cliques is None else [sorted(c) for c in cliques]
+        self.ts = ts
+        self.ts_order = ts_order
         self.bases = None
         self.grams = None
+        self.blocks = None
 
     @property
     def block_sizes(self):
@@ -236,9 +248,17 @@ class SOSMatrix:
     single dense SOS matrix is used. ``nu=0`` by default; increasing ``nu``
     weakens the constraint towards positive semidefiniteness of ``P`` away
     from the origin (Theorem 3.4 in the paper).
+
+    ``ts`` additionally imposes term sparsity (TSSOS-style; Miller, Wang &
+    Guo, arXiv:2411.15479, Section 3.2) inside each clique's Gram matrix:
+    the term sparsity pattern graph on nodes ``(row, basis monomial)`` is
+    grown by support extension plus either the block closure (``"block"``)
+    or a minimum-degree chordal closure (``"MD"``), and each of its cliques
+    becomes one small PSD block. ``ts_order`` is the sparse order ``s``
+    (``None`` iterates to stabilization).
     """
 
-    def __init__(self, P, sparse=True, nu=0, cliques=None, nvars=None):
+    def __init__(self, P, sparse=True, nu=0, cliques=None, nvars=None, ts=None, ts_order=None):
         if isinstance(P, Polynomial):
             raise TypeError("use SOS (or p >> 0) for scalar polynomials")
         if not isinstance(P, PolyMatrix):
@@ -247,8 +267,11 @@ class SOSMatrix:
         self.sparse = bool(sparse)
         self.nu = int(nu)
         self.cliques = None if cliques is None else [sorted(c) for c in cliques]
+        self.ts = ts
+        self.ts_order = ts_order
         self.bases = None
         self.grams = None
+        self.blocks = None
 
     @property
     def block_sizes(self):
@@ -350,16 +373,27 @@ def _compile_sos(con):
 
     lhs = defaultdict(list)
     con.grams = []
+    con.blocks = []
+    numeric_supp = set(supp)
     for B in con.bases:
         if not B:
             con.grams.append(None)
             continue
-        Q = cp.Variable((len(B), len(B)), PSD=True)
-        con.grams.append(Q)
-        for a in range(len(B)):
-            for b in range(a, len(B)):
-                gamma = tuple(x + y for x, y in zip(B[a], B[b]))
-                lhs[gamma].append(Q[a, b] if a == b else 2 * Q[a, b])
+        if con.ts:
+            blocks, _ = ts_matrix_blocks(
+                {(0, 0): numeric_supp}, [B], method=con.ts, max_steps=con.ts_order
+            )
+            block_bases = [[alpha for _, alpha in blk] for blk in blocks]
+        else:
+            block_bases = [B]
+        for BB in block_bases:
+            con.blocks.append(BB)
+            Q = cp.Variable((len(BB), len(BB)), PSD=True)
+            con.grams.append(Q)
+            for a in range(len(BB)):
+                for b in range(a, len(BB)):
+                    gamma = tuple(x + y for x, y in zip(BB[a], BB[b]))
+                    lhs[gamma].append(Q[a, b] if a == b else 2 * Q[a, b])
     return _match_coefficients(lhs, p.terms, "SOS")
 
 
@@ -385,10 +419,10 @@ def _compile_sos_matrix(con):
 
     if m == 1 and con.cliques is None:
         # scalar case: fall back to correlative (variable) sparsity
-        inner = SOS(P[0, 0], sparse=con.sparse)
+        inner = SOS(P[0, 0], sparse=con.sparse, ts=con.ts, ts_order=con.ts_order)
         out = inner.compile()
         con.cliques = [[0]]
-        con.bases, con.grams = inner.bases, inner.grams
+        con.bases, con.grams, con.blocks = inner.bases, inner.grams, inner.blocks
         return out
 
     nonzero = [(i, j) for i in range(m) for j in range(m) if not P[i, j].is_zero()]
@@ -428,10 +462,36 @@ def _compile_sos_matrix(con):
 
     lhs = {}  # (i, j) i<=j -> {gamma: [exprs]}
     con.grams = []
+    con.blocks = []
     for C, B in zip(con.cliques, con.bases):
         mk, nB = len(C), len(B)
         if nB == 0:
             con.grams.append(None)
+            continue
+        if con.ts:
+            supports = {}
+            for ii in range(mk):
+                for jj in range(ii, mk):
+                    supports[(ii, jj)] = set(P[C[ii], C[jj]].terms)
+            blocks, _ = ts_matrix_blocks(
+                supports, [B] * mk, method=con.ts, max_steps=con.ts_order
+            )
+            for blk in blocks:
+                con.blocks.append([(C[ii], alpha) for ii, alpha in blk])
+                nblk = len(blk)
+                Q = cp.Variable((nblk, nblk), PSD=True)
+                con.grams.append(Q)
+                # ordered node pairs with row(a) <= row(b) fill the upper
+                # triangle of sum_k E_k' S_k E_k, exactly as the dense loop
+                for a in range(nblk):
+                    ii, alpha = blk[a]
+                    for b in range(nblk):
+                        jj, beta = blk[b]
+                        if C[ii] > C[jj]:
+                            continue
+                        dest = lhs.setdefault((C[ii], C[jj]), defaultdict(list))
+                        gamma = tuple(x + y for x, y in zip(alpha, beta))
+                        dest[gamma].append(Q[a, b])
             continue
         Q = cp.Variable((mk * nB, mk * nB), PSD=True)
         con.grams.append(Q)

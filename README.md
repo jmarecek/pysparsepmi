@@ -1,7 +1,8 @@
 # pysparsepmi
 
 Sparse sum-of-squares (SOS) relaxations for **polynomial matrix inequalities
-(PMIs)** in Python, exploiting chordal sparsity.
+(PMIs)** in Python, exploiting chordal (correlative/matrix) sparsity and
+term sparsity.
 
 The methods implemented here are based on:
 
@@ -105,17 +106,39 @@ print(res.value, res.cliques, res.block_sizes)
 For scalar polynomial optimization with constraints (sparse Lasserre / Waki
 et al.), use `psp.sos_lower_bound(f, ineqs=[...], order=d)`.
 
+### Term sparsity (TSSOS-style)
+
+`ts="block"` or `ts="MD"` (mirroring TSSOS's `TS=` option) additionally
+splits every Gram matrix into blocks along the cliques of the *term
+sparsity pattern* graph, grown by iterating support extension and chordal
+extension (block closure or minimum-degree chordal closure; Miller, Wang &
+Guo, arXiv:2411.15479):
+
+```python
+# first step of the term-sparsity hierarchy, as in
+# tssos(F, G, x, 3, TS="MD") followed by tssos(data, TS="MD"):
+res1 = psp.pmi_optimize(F, ineqs=[G1, G2], order=3, ts="MD", ts_order=1)
+res2 = psp.pmi_optimize(F, ineqs=[G1, G2], order=3, ts="MD", ts_order=2)
+res  = psp.pmi_optimize(F, ineqs=[G1, G2], order=3, ts="MD")  # stabilized
+res.block_sizes, res.ts_block_sizes    # PSD blocks per constraint
+```
+
+The bounds are monotone in the sparse order `ts_order` and converge to the
+dense bound of the same relaxation order at stabilization
+(`ts_order=None`). The same keywords work on constraint objects
+(`SOS(p, ts=...)`, `SOSMatrix(P, ts=...)`) and on `sos_lower_bound`.
+
 ## API summary
 
 | Function / class | Purpose |
 |---|---|
 | `polyvar(n)` | create `n` polynomial variables |
 | `PolyMatrix([[...]])`, `eye(m, nvars)` | build symmetric polynomial matrices |
-| `p >> 0`, `SOS(p, sparse=True)` | scalar SOS constraint with correlative-sparsity basis splitting |
-| `P >> 0`, `SOSMatrix(P, sparse=True, nu=...)` | matrix SOS constraint with chordal clique decomposition |
+| `p >> 0`, `SOS(p, sparse=True, ts=...)` | scalar SOS constraint with correlative-sparsity basis splitting (optionally term sparsity) |
+| `P >> 0`, `SOSMatrix(P, sparse=True, nu=..., ts=...)` | matrix SOS constraint with chordal clique decomposition (optionally term sparsity) |
 | `Problem(objective, constraints).solve()` | CVXPY-style problem wrapper |
-| `pmi_optimize(F, ineqs, order=d)` | lower-bound `lambda_min(F)` on a semialgebraic set |
-| `sos_lower_bound(f, ineqs, order=d)` | sparse Lasserre lower bound for scalar polynomials |
+| `pmi_optimize(F, ineqs, order=d, ts=..., ts_order=s)` | lower-bound `lambda_min(F)` on a semialgebraic set |
+| `sos_lower_bound(f, ineqs, order=d, ts=..., ts_order=s)` | sparse Lasserre lower bound for scalar polynomials |
 | `chordal_cliques(pattern)` | maximal cliques of a chordal extension |
 | `correlative_sparsity(polys)` | correlative sparsity pattern of a set of polynomials |
 
@@ -124,13 +147,21 @@ Gram-parameterized SOS multipliers, `monomials`, `gram_candidates`,
 `reduce_bases` handle basis generation and Newton-style reduction.
 
 **Scope notes.** This package implements *correlative/matrix* (clique)
-sparsity — not *term* sparsity — and provides bounds only (no moment-side
-solution extraction).
+sparsity and *term* sparsity (block closure and minimum-degree chordal
+closure), and provides bounds only (no moment-side solution extraction).
 
 ## Examples
 
 - `examples/tssos_pmi.py` — two small PMI optimization problems (the first
   bound, −4.0, is exact).
+- `examples/term_sparsity_pmi.py` — the term-sparsity hierarchy
+  (`ts="MD"`, sparse orders 1, 2, stabilized) on a 5-variable, 5x5 PMI
+  problem with two PMI constraints, mirroring TSSOS's
+  `tssos(F, G, x, 3, TS="MD")`.
+- `examples/quantum_identification.py` — certified GKSL (Lindblad)
+  parameter reconstruction for a qubit (arXiv:2501.05270): bounding the
+  reconstruction residual subject to a PSD Kossakowski matrix, including a
+  certificate that no physical model fits non-physical data.
 - `examples/banded_pmi.py` — banded parametric PMI in the style of Example
   5.1 of Zheng & Fantuzzi, comparing sparse clique blocks against the dense
   certificate.
@@ -150,6 +181,9 @@ Run the tests with `python tests/test_pysparsepmi.py` (or `pytest`).
    structured sparsity. SIAM J. Optim. 17(1).
 4. C. W. Scherer, C. W. J. Hol (2006). Matrix sum-of-squares relaxations for
    robust semi-definite programs. Math. Program. 107.
+5. W. Parvaiz, J. Aspman, A. Wodecki, G. Korpas, J. Marecek (2025).
+   Identifiability of autonomous and controlled open quantum systems.
+   arXiv:2501.05270.
 
 ## Appendix: correspondence with YALMIP and TSSOS
 
@@ -161,6 +195,8 @@ Run the tests with `python tests/test_pysparsepmi.py` (or `pytest`).
 | `P >> 0`, `SOSMatrix(P, sparse=True, nu=...)` | scalarized `u'*P*u` + `sos.csp` | — |
 | `Problem(cp.Maximize(t), cons).solve()` | `solvesos(CNSTR, -t, opts, params)` | — |
 | `pmi_optimize(F, ineqs, order=d)` | — | `tssos(F, G, x, d, TS=false)` |
+| `pmi_optimize(..., ts="MD", ts_order=s)` | — | `tssos(F, G, x, d, TS="MD")`, then `tssos(data, TS="MD")` |
 | `sos_lower_bound(f, ineqs, order=d)` | `solvesos` + `sos.csp` | `cs_tssos(f, g, x, d)` (CS only) |
+| `sos_lower_bound(..., ts="block")` | — | `tssos(f, g, x, d, TS="block")` |
 | `chordal_cliques(pattern)` | `cliquesFromSpMatD.m` | `clique_decomp` |
 | `correlative_sparsity(polys)` | `corrsparsity.m` | — |

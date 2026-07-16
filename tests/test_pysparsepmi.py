@@ -196,6 +196,79 @@ def test_pmi_sparse_matches_dense():
 
 
 # ----------------------------------------------------------------------
+# term sparsity (TSSOS-style; arXiv:2411.15479)
+# ----------------------------------------------------------------------
+def test_sos_ts_unconstrained_exact():
+    # min x^4 - 3x^2: the TS blocks split {1, x^2} | {x} and stay exact
+    (x,) = psp.polyvar(1)
+    res = psp.sos_lower_bound(x**4 - 3 * x**2, ts="block", **SOLVER_OPTS)
+    assert abs(res.value - (-2.25)) < TOL, res.value
+    assert max(res.block_sizes) <= 2, res.block_sizes
+
+
+def test_sos_ts_blocks():
+    x, y = psp.polyvar(2)
+    f = 1 + x**4 + y**4 + x * y
+    con = psp.SOS(f, ts="block")
+    prob = psp.Problem(None, [con])
+    prob.solve(**SOLVER_OPTS)
+    assert prob.status in ("optimal", "optimal_inaccurate"), prob.status
+    # dense Gram basis has 6 monomials; TS splits it into blocks
+    assert max(con.block_sizes) <= 4, con.block_sizes
+    assert sum(con.block_sizes) >= 6
+
+
+def test_sos_matrix_ts_example32():
+    # Example 3.2 of arXiv:2411.15479: 2x2 bivariate SOS matrix whose TSP
+    # graph splits into small components
+    x1, x2 = psp.polyvar(2)
+    F = psp.PolyMatrix(
+        [
+            [1 + x1**2 + 2 * x1**2 * x2**2 + x2**2, x1 * x2],
+            [x1 * x2, 2 + x1**2 * x2**2 + x2**4],
+        ]
+    )
+    for method in ("block", "MD"):
+        con = psp.SOSMatrix(F, ts=method)
+        prob = psp.Problem(None, [con])
+        prob.solve(**SOLVER_OPTS)
+        assert prob.status in ("optimal", "optimal_inaccurate"), (method, prob.status)
+        assert max(con.block_sizes) <= 4, (method, con.block_sizes)
+    dense = psp.SOSMatrix(F, sparse=False)
+    psp.Problem(None, [dense]).compile()
+    assert max(dense.block_sizes) == 10
+
+
+def test_pmi_ts_hierarchy():
+    # TS bounds are monotone in the sparse order s and converge to the
+    # dense bound at stabilization (Prop. 4.1 of arXiv:2411.15479)
+    x1, x2 = psp.polyvar(2)
+    F = psp.PolyMatrix([[1 + x1**2, x1], [x1, 1]])
+    G = psp.PolyMatrix([[x1 * x2 * (-4.0) + 1, x1], [x1, 4 - x1**2 - x2**2]])
+    ineqs = [G, 1 - x2**2]
+    dense = psp.pmi_optimize(F, ineqs=ineqs, order=2, sparse=False, **SOLVER_OPTS)
+    ts1 = psp.pmi_optimize(F, ineqs=ineqs, order=2, ts="MD", ts_order=1, **SOLVER_OPTS)
+    ts_stab = psp.pmi_optimize(F, ineqs=ineqs, order=2, ts="MD", **SOLVER_OPTS)
+    assert ts1.ts_order == 1
+    assert ts1.value <= ts_stab.value + TOL
+    assert ts_stab.value <= dense.value + TOL
+    assert abs(ts_stab.value - dense.value) < TOL, (ts_stab.value, dense.value)
+    # the first TS step must use smaller certificate blocks than dense
+    assert max(ts1.block_sizes) < max(dense.block_sizes)
+    assert ts_stab.ts_block_sizes is not None
+
+
+def test_sos_lower_bound_ts_chain():
+    x = psp.polyvar(4)
+    f = sum(
+        ((x[i] * x[i + 1] - 1) ** 2 for i in range(3)),
+        psp.Polynomial.zero(4),
+    )
+    res = psp.sos_lower_bound(f, order=2, ts="block", **SOLVER_OPTS)
+    assert abs(res.value) < TOL, res.value
+
+
+# ----------------------------------------------------------------------
 # parametric coefficients (YALMIP-style SOS programming)
 # ----------------------------------------------------------------------
 def test_parametric_sos_matrix():

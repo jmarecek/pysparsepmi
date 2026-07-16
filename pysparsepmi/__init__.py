@@ -4,7 +4,11 @@ A Python port of the sparse-PMI machinery from
 
 * Zheng & Fantuzzi (2020), "Sum-of-squares chordal decomposition of
   polynomial matrix inequalities" (the ``sos.csp`` option in YALMIP, as
-  adapted in aeroimperial-optimization/sos-chordal-decomposition-pmi), and
+  adapted in aeroimperial-optimization/sos-chordal-decomposition-pmi),
+* Miller, Wang & Guo (2024), "Sparse polynomial matrix optimization"
+  (arXiv:2411.15479): term sparsity for PMIs and constrained polynomial
+  matrix optimization (the ``ts=``/``ts_order=`` options, mirroring
+  TSSOS's ``TS=`` keyword), and
 * the polynomial-matrix examples of TSSOS (wangjie212/TSSOS,
   ``example/pmi.jl``).
 

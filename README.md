@@ -150,3 +150,17 @@ Run the tests with `python tests/test_pysparsepmi.py` (or `pytest`).
    structured sparsity. SIAM J. Optim. 17(1).
 4. C. W. Scherer, C. W. J. Hol (2006). Matrix sum-of-squares relaxations for
    robust semi-definite programs. Math. Program. 107.
+
+## Appendix: correspondence with YALMIP and TSSOS
+
+| pysparsepmi | YALMIP / MATLAB | TSSOS (Julia) |
+|---|---|---|
+| `polyvar(n)` | `sdpvar x y ...` | `@polyvar x[1:n]` |
+| `PolyMatrix([[...]])`, `eye(m, nvars)` | matrix of `sdpvar` polys | `Matrix{Poly}` |
+| `p >> 0`, `SOS(p, sparse=True)` | `sos(p)` + `sdpsettings('sos.csp',1)` | — |
+| `P >> 0`, `SOSMatrix(P, sparse=True, nu=...)` | scalarized `u'*P*u` + `sos.csp` | — |
+| `Problem(cp.Maximize(t), cons).solve()` | `solvesos(CNSTR, -t, opts, params)` | — |
+| `pmi_optimize(F, ineqs, order=d)` | — | `tssos(F, G, x, d, TS=false)` |
+| `sos_lower_bound(f, ineqs, order=d)` | `solvesos` + `sos.csp` | `cs_tssos(f, g, x, d)` (CS only) |
+| `chordal_cliques(pattern)` | `cliquesFromSpMatD.m` | `clique_decomp` |
+| `correlative_sparsity(polys)` | `corrsparsity.m` | — |

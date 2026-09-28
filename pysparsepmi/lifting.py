@@ -374,9 +374,10 @@ def _chord(stages, bounds, sign, order, solver, verbose, solver_kwargs):
             elim += idx_s[i]
         elim += idx_x[i]
     cliques = chordal_cliques(edges, n=N, order=elim)
+    x_index = [j for idx in idx_x for j in idx]
 
     if stages[-1].shape is not None:
-        return pmi_optimize(
+        res = pmi_optimize(
             objective,
             ineqs=ineqs,
             eqs=eqs,
@@ -387,7 +388,9 @@ def _chord(stages, bounds, sign, order, solver, verbose, solver_kwargs):
             verbose=verbose,
             **solver_kwargs
         )
-    return sos_lower_bound(
+        res.x_index = x_index
+        return res
+    res = sos_lower_bound(
         objective,
         ineqs=ineqs,
         eqs=eqs,
@@ -398,6 +401,8 @@ def _chord(stages, bounds, sign, order, solver, verbose, solver_kwargs):
         verbose=verbose,
         **solver_kwargs
     )
+    res.x_index = x_index
+    return res
 
 
 def _push(stages, bounds, sign, order, solver, verbose, solver_kwargs):
@@ -467,6 +472,9 @@ def _push(stages, bounds, sign, order, solver, verbose, solver_kwargs):
 
     problem = Problem(cp.Maximize(t), cons)
     problem.solve(solver=solver, verbose=verbose, **solver_kwargs)
+    sources = [
+        (con, list(range(st.r_in, st.r_in + st.xdim))) for con, st in zip(cons, stages)
+    ]
     return PMIResult(
         value=problem.value,
         status=problem.status,
@@ -477,7 +485,41 @@ def _push(stages, bounds, sign, order, solver, verbose, solver_kwargs):
         t=t,
         multipliers=multipliers,
         eq_multipliers=eq_multipliers,
+        moment_source=sources,
     )
+
+
+def _chain_functions(stages, outputs, sense):
+    """Evaluators of the original chain objective and local constraints."""
+
+    def walk(x):
+        s, pos = [], 0
+        for st, outs in zip(stages, outputs):
+            pt = np.array(s + list(x[pos : pos + st.xdim]), dtype=float)
+            pos += st.xdim
+            yield st, pt, [p(pt) for p in outs]
+            s = [p(pt) for p in outs]
+
+    def objective(x):
+        for st, pt, vals in walk(x):
+            pass
+        if st.shape is None:
+            return vals[0]
+        m = st.shape[0]
+        M = np.array(vals).reshape(m, m)
+        ev = np.linalg.eigvalsh((M + M.T) / 2)
+        return ev.min() if sense == "min" else ev.max()
+
+    def violation(x):
+        v = 0.0
+        for st, pt, _ in walk(x):
+            for g in st.ineqs:
+                v = max(v, -g(pt))
+            for h in st.eqs:
+                v = max(v, abs(h(pt)))
+        return v
+
+    return objective, violation
 
 
 def composition_lower_bound(
@@ -544,6 +586,10 @@ def composition_lower_bound(
         Strongly recommended for first-order solvers such as SCS.
 
     Returns a :class:`PMIResult`; ``ranks`` holds ``(r_1, ..., r_{n-1})``.
+    ``res.minimizer()`` recovers candidate controls ``x = (x_1, ..., x_n)``
+    from the pseudo-moments (SL-chord: the lifted moment sequence; SL-push:
+    the first moments of every stage measure), and ``res.gap()`` /
+    ``res.max_violation(x)`` evaluate the original chain at that point.
     For ``method="chord"``, variables are numbered ``x_1, s_1, x_2, s_2, ...``
     in ``cliques``; for ``method="push"`` each entry of ``cliques`` lists the
     variables ``(s_{i-1}, x_i)`` of one stage certificate in the same
@@ -555,6 +601,7 @@ def composition_lower_bound(
         raise ValueError("sense must be 'min' or 'max'")
     stages = _discover(maps, xdims, box, local_ineqs, local_eqs)
     bounds = _state_bounds(stages, state_bounds)
+    original = [list(st.outputs) for st in stages]
     obj_scale = _rescale(stages, bounds) if scale else 1.0
     sign = 1.0 if sense == "min" else -1.0
     run = _chord if method == "chord" else _push
@@ -562,6 +609,8 @@ def composition_lower_bound(
     if res.value is not None:
         res.value = sign * obj_scale * res.value
     res.ranks = [len(st.outputs) for st in stages[:-1]]
+    res.sense = sense
+    res.evaluate_fn, res.violation_fn = _chain_functions(stages, original, sense)
     return res
 
 

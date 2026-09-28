@@ -226,6 +226,38 @@ constraints and user-given cliques, `chordal_cliques(pattern, order=...)`
 for a prescribed elimination order, and `compose` / `Polynomial.embed`
 for substitution and variable-space changes.
 
+### Recovering minimizers
+
+The dual variables of the coefficient-matching constraints are the
+pseudo-moments of the relaxation, so every result can propose minimizers
+and certify them:
+
+```python
+res = psp.sos_lower_bound(x + y, eqs=[x**2 + y**2 - 1])
+xs = res.minimizer()                 # first-order moments: [-0.7071, -0.7071]
+res.gap(), res.max_violation(xs)     # ~0, ~0: bound tight, xs globally optimal
+res.moment_matrix(order=1)           # rank 1 <=> a single atom
+
+res = psp.pmi_optimize(F, ineqs=[G, 1 - x2**2], order=2)   # two minimizers
+res.atoms()                          # Henrion-Lasserre extraction: both points
+```
+
+- `minimizer()` returns the first-order moments. It is exact when the
+  optimal pseudo-moments come from a single point, and averages the
+  minimizers otherwise.
+- `atoms(vars=None, order=None)` extracts several minimizers from a flat
+  moment matrix (Henrion & Lasserre). With correlative sparsity, cross-clique
+  moments do not exist, so pass the variables of one clique.
+- For PMIs, the matrix-valued moments are trace-normalized.
+- For lifted problems, `minimizer()` returns the original variables
+  `x_1..x_n`: from the lifted moments (SL-chord) or from the first moments
+  of each stage measure (SL-push).
+- `gap(x)` and `max_violation(x)` evaluate the original objective
+  (`lambda_min`/`lambda_max` for PMIs; the original chain for lifted
+  problems) and constraints. A feasible point with zero gap certifies both
+  the bound and global optimality, and a positive gap at a good point shows
+  that the bound is loose.
+
 ## API summary
 
 | Function / class | Purpose |
@@ -241,6 +273,7 @@ for substitution and variable-space changes.
 | `pmi_optimize(F, ineqs, eqs=[...], cs=True)` | PMI bound with equalities and correlative sparsity in the variables |
 | `composition_lower_bound(maps, box, method="chord"/"push")` | state-lifting bounds for chained polynomial maps (SL-chord / SL-push) |
 | `cp_lower_bound(factors, ...)`, `tt_lower_bound(cores, ...)` | LRPOP for CP polynomials, state lifting for tensor trains |
+| `res.minimizer()`, `res.atoms()`, `res.gap(x)`, `res.max_violation(x)` | recover and certify minimizers from the pseudo-moments |
 | `chordal_cliques(pattern, order=...)` | maximal cliques of a chordal extension (optional elimination order) |
 | `correlative_sparsity(polys)` | correlative sparsity pattern of a set of polynomials |
 
@@ -253,8 +286,9 @@ Gram-parameterized SOS multipliers, `monomials`, `gram_candidates`,
 **Scope notes.** This package implements *correlative/matrix* (clique)
 sparsity, *term* sparsity (block closure and minimum-degree chordal
 closure) and *state lifting* for composition, tensor-train and CP structure
-(scalar and matrix-valued objectives), and provides bounds only (no
-moment-side solution extraction).
+(scalar and matrix-valued objectives). Minimizers are recovered from the
+pseudo-moments (first moments or Henrion–Lasserre atom extraction; sparse
+gluing of atoms across cliques is not implemented).
 
 ## Examples
 
@@ -276,7 +310,8 @@ moment-side solution extraction).
   `r` for `n` up to 20 (total degree 40) with a constant 15x15 PSD block.
 - `examples/markov_chain_composition.py` — certified upper bounds for a
   controlled two-state Markov chain (arXiv:2604.17563, Sec. 7.1), SL-chord
-  versus SL-push, against the closed form `1/2 + 0.9^n/2`.
+  versus SL-push, against the closed form `1/2 + 0.9^n/2`, with the
+  optimal controls recovered from the pseudo-moments.
 - `examples/matrix_product_gain.py` — worst-case gain
   `max lambda_max(P'P)` of a product of parameter-dependent 2x2 matrices,
   lifting the symmetric states `S_i = M(x_i)' S_{i-1} M(x_i)` with a

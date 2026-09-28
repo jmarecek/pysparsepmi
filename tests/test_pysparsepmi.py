@@ -478,6 +478,53 @@ def test_matrix_terminal_map_push():
     )
     assert samp - TOL <= res.value <= samp + 0.02, (res.value, samp)
 
+
+# ----------------------------------------------------------------------
+# moment-side solution recovery
+# ----------------------------------------------------------------------
+def test_minimizer_scalar_with_equality():
+    x, y = psp.polyvar(2)
+    res = psp.sos_lower_bound(x + y, eqs=[x**2 + y**2 - 1], **SOLVER_OPTS)
+    xs = res.minimizer()
+    assert np.allclose(xs, [-np.sqrt(0.5)] * 2, atol=1e-3), xs
+    assert abs(res.gap()) < TOL and res.max_violation(xs) < TOL
+    assert np.linalg.matrix_rank(res.moment_matrix(order=1), tol=1e-4) == 1
+
+
+def test_atoms_two_minimizers_pmi():
+    # TSSOS example/pmi.jl: symmetric under x -> -x, two global minimizers
+    x1, x2 = psp.polyvar(2)
+    F = psp.PolyMatrix([[1 + x1**2, x1], [x1, 1]])
+    G = psp.PolyMatrix([[x1 * x2 * (-4.0) + 1, x1], [x1, 4 - x1**2 - x2**2]])
+    res = psp.pmi_optimize(F, ineqs=[G, 1 - x2**2], order=2, **SOLVER_OPTS)
+    atoms = res.atoms()
+    assert atoms.shape == (2, 2), atoms
+    assert np.allclose(atoms[0], -atoms[1], atol=1e-3), atoms
+    for a in atoms:
+        assert abs(res.gap(a)) < TOL and res.max_violation(a) < TOL
+
+
+def test_atoms_per_clique():
+    x, y = psp.polyvar(2)
+    res = psp.sos_lower_bound((x**2 - 1) ** 2 + (y - 0.5) ** 2, order=2, **SOLVER_OPTS)
+    assert sorted(res.atoms(vars=[0])[:, 0].round(3)) == [-1.0, 1.0]
+    assert np.allclose(res.atoms(vars=[1]), [[0.5]], atol=1e-3)
+
+
+def test_lifted_minimizer_recovery():
+    brute_x = np.array([1.0, -1.0, -1.0, 1.0, -1.0])  # argmin of Example 3.1
+    for method in ("chord", "push"):
+        res = psp.cp_lower_bound(_lrpop_example(), box=1.0, order=2, method=method, **SOLVER_OPTS)
+        xs = res.minimizer()
+        assert np.allclose(xs, brute_x, atol=1e-3), (method, xs)
+        assert abs(res.objective_at(xs) + 180) < 1e-3
+        assert abs(res.gap()) < 180 * TOL
+    res = psp.composition_lower_bound(
+        _markov_maps(5), box=1.0, order=2, sense="max", **SOLVER_OPTS
+    )
+    assert np.allclose(res.minimizer(), 0.0, atol=1e-3)
+    assert abs(res.gap()) < TOL
+
 if __name__ == "__main__":
     import sys
     import traceback

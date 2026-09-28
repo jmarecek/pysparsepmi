@@ -10,7 +10,9 @@ and controls x_i in [-1, 1]. The probability of being in the working state
 at time n is a tensor-train polynomial of degree 2n. Its maximum is
 1/2 + 0.9^n / 2 (controls off), which lets us check the certified upper
 bounds of SL-chord and SL-push. The states are the rank-2 distributions,
-so the PSD blocks do not grow with n.
+so the PSD blocks do not grow with n. The optimal controls (all zero) are
+recovered from the pseudo-moments; a zero gap between the bound and the
+value at the recovered controls certifies global optimality.
 """
 import time
 
@@ -51,6 +53,11 @@ def run(sizes=(5, 10, 20)):
                 "n = %2d  %-5s  upper bound %.6f  exact %.6f  (%s)  max PSD block %d, %.1fs"
                 % (n, method, res.value, exact, res.status, max(res.block_sizes),
                    time.time() - t0)
+            )
+            x = res.minimizer()  # controls recovered from the pseudo-moments
+            print(
+                "         controls max|x_i| = %.1e, value at controls %.6f, gap %.1e"
+                % (abs(x).max(), res.objective_at(x), res.gap(x))
             )
 
 

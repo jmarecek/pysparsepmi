@@ -27,6 +27,7 @@ from .chordal import chordal_cliques, correlative_sparsity
 from .basis import monomials
 from .termsparsity import graph_blocks
 from .sos import (
+    normalized_moments,
     PolyMatrix,
     Problem,
     SOS,
@@ -71,6 +72,235 @@ class PMIResult:
     eq_multipliers: Any = field(repr=False, default=None)
     ranks: Optional[List[int]] = None
     var_cliques: Optional[List[List[int]]] = None
+    sense: str = "min"
+    moment_source: Any = field(repr=False, default=None)
+    x_index: Optional[List[int]] = field(repr=False, default=None)
+    evaluate_fn: Any = field(repr=False, default=None)
+    violation_fn: Any = field(repr=False, default=None)
+
+    # ------------------------------------------------------------------
+    # moment-side solution recovery
+    # ------------------------------------------------------------------
+    def moments(self):
+        """Normalized pseudo-moments ``{exponent: y}`` from the SDP duals.
+
+        For SL-push results, a list with one dict per stage measure (in the
+        local variables ``(s_{i-1}, x_i)`` of that stage).
+        """
+        src = self._source()
+        if isinstance(src, list):
+            return [con.moments() for con, _ in src]
+        return src.moments()
+
+    def minimizer(self):
+        """Candidate minimizer: the first-order pseudo-moments of ``x``.
+
+        Exact when the optimal pseudo-moments come from a single point
+        (moment matrices of rank one), which is typical when the relaxation
+        is tight and the minimizer unique. Check it with :meth:`gap` and
+        :meth:`max_violation`: a feasible point with zero gap certifies both
+        the bound and global optimality. For lifted (composition) problems
+        only the original variables ``x_1, ..., x_n`` are returned.
+        """
+        src = self._source()
+        if isinstance(src, list):  # SL-push: one measure per stage
+            parts = []
+            for con, idx in src:
+                y = con.moments()
+                parts += [_first_moment(y, con.nvars, i) for i in idx]
+            return np.array(parts)
+        y = src.moments()
+        idx = self.x_index if self.x_index is not None else range(src.nvars)
+        return np.array([_first_moment(y, src.nvars, i) for i in idx])
+
+    def moment_matrix(self, vars=None, order=1):
+        """Pseudo-moment matrix ``[y_{a+b}]`` over monomials in ``vars``.
+
+        ``vars`` are indices in the relaxation's variable space (for lifted
+        problems: the ``x_1, s_1, x_2, ...`` numbering of ``cliques``);
+        defaults to all variables. Its numerical rank (1 for a single atom)
+        indicates whether :meth:`minimizer` is exact. Unknown moments are
+        ``nan``.
+        """
+        src = self._source()
+        if isinstance(src, list):
+            raise NotImplementedError("use moments() for per-stage SL-push measures")
+        y = src.moments()
+        B = monomials(src.nvars, order, vars=vars)
+        M = np.full((len(B), len(B)), np.nan)
+        for a, alpha in enumerate(B):
+            for b, beta in enumerate(B):
+                M[a, b] = y.get(tuple(u + v for u, v in zip(alpha, beta)), np.nan)
+        return M
+
+    def atoms(self, vars=None, order=None, tol=1e-4, seed=0):
+        """Several minimizers from a flat moment matrix (Henrion & Lasserre).
+
+        Builds the pseudo-moment matrix of ``order`` over ``vars`` (default:
+        all variables and the largest order whose moments are known), and
+        extracts its atoms when it is flat, i.e. when its rank ``r`` (with
+        relative singular-value threshold ``tol``) equals the rank of its
+        order-``(order - 1)`` principal submatrix. Returns an ``r x len(vars)``
+        array of points (their coordinates in ``vars``). This handles
+        problems with several global minimizers, where :meth:`minimizer`
+        returns their average. With correlative sparsity, pass the variables
+        of one clique. Raises ``ValueError`` if the matrix is not flat.
+        """
+        src = self._source()
+        if isinstance(src, list):
+            raise NotImplementedError("use moments() for per-stage SL-push measures")
+        n = src.nvars
+        vars = list(range(n)) if vars is None else sorted(int(v) for v in vars)
+        if order is None:
+            order = 1
+            while not np.isnan(self.moment_matrix(vars, order + 1)).any():
+                order += 1
+                if order > 20:
+                    break
+        return _extract_atoms(self.moment_matrix(vars, order), monomials(n, order, vars=vars),
+                              vars, order, tol, seed)
+
+    def objective_at(self, x):
+        """Objective value at ``x`` (``lambda_min`` / ``lambda_max`` for PMIs)."""
+        if self.evaluate_fn is None:
+            raise NotImplementedError("objective evaluation is not available")
+        return float(self.evaluate_fn(np.asarray(x, dtype=float)))
+
+    def max_violation(self, x):
+        """Largest constraint violation at ``x`` (0 when feasible)."""
+        if self.violation_fn is None:
+            raise NotImplementedError("constraint evaluation is not available")
+        return float(self.violation_fn(np.asarray(x, dtype=float)))
+
+    def gap(self, x=None):
+        """``objective(x) - bound`` (``bound - objective(x)`` for ``sense="max"``).
+
+        Defaults to the extracted :meth:`minimizer`. For a feasible ``x``
+        the gap is nonnegative up to solver accuracy, and zero certifies
+        that the bound is tight and ``x`` is a global optimum.
+        """
+        if x is None:
+            x = self.minimizer()
+        v = self.objective_at(x)
+        return v - self.value if self.sense == "min" else self.value - v
+
+    def _source(self):
+        if self.moment_source is None:
+            raise NotImplementedError("moment extraction is not available for this result")
+        return self.moment_source
+
+
+def _rank(M, tol):
+    sv = np.linalg.svd(M, compute_uv=False)
+    return int(np.sum(sv > tol * max(sv[0], 1e-300))), sv
+
+
+def _extract_atoms(M, basis, vars, order, tol, seed):
+    """Henrion–Lasserre extraction of atoms from a flat moment matrix."""
+    if np.isnan(M).any():
+        raise ValueError(
+            "some moments of this matrix are unknown; restrict vars to one "
+            "clique or lower the order"
+        )
+    basis = [tuple(b) for b in basis]
+    low = [a for a, b in enumerate(basis) if sum(b) <= order - 1]
+    r, _ = _rank(M, tol)
+    r_low, _ = _rank(M[np.ix_(low, low)], tol)
+    if r != r_low:
+        raise ValueError(
+            "moment matrix is not flat (rank %d at order %d, %d at order %d); "
+            "try a higher relaxation order" % (r, order, r_low, order - 1)
+        )
+    # M = V V' with V of rank r, then column echelon form V = U W
+    w, U = np.linalg.eigh((M + M.T) / 2)
+    keep = np.argsort(w)[::-1][:r]
+    V = U[:, keep] * np.sqrt(np.maximum(w[keep], 0.0))
+    E, pivots = _column_echelon(V, tol)
+    # the pivot monomials must have degree <= order - 1 so that x_j * w_k is
+    # still in the basis (guaranteed by flatness for a proper echelon form)
+    index = {b: a for a, b in enumerate(basis)}
+    N = []
+    for v in vars:
+        Nj = np.zeros((r, r))
+        for k, piv in enumerate(pivots):
+            shifted = list(basis[piv])
+            shifted[v] += 1
+            row = index.get(tuple(shifted))
+            if row is None:
+                raise ValueError("extraction failed: pivot monomials of too high degree")
+            Nj[k, :] = E[row, :]
+        N.append(Nj)
+    rng = np.random.RandomState(seed)
+    lam = rng.rand(len(vars))
+    lam /= lam.sum()
+    Ncomb = sum(l * Nj for l, Nj in zip(lam, N))
+    # ordered Schur decomposition via QR of the eigenvector basis (real atoms)
+    evals, evecs = np.linalg.eig(Ncomb)
+    Q, _ = np.linalg.qr(np.real(evecs))
+    T = [Q.T @ Nj @ Q for Nj in N]
+    return np.array([[T[j][k, k] for j in range(len(vars))] for k in range(r)])
+
+
+def _column_echelon(V, tol):
+    """Reduced column echelon form ``E`` of ``V`` (rows = monomials) and pivots."""
+    A = V.copy()
+    rows, cols = A.shape
+    pivots = []
+    c = 0
+    scale = max(np.abs(A).max(), 1e-300)
+    for i in range(rows):
+        if c >= cols:
+            break
+        j = c + int(np.argmax(np.abs(A[i, c:])))
+        if abs(A[i, j]) <= tol * scale:
+            A[i, c:] = 0.0
+            continue
+        A[:, [c, j]] = A[:, [j, c]]
+        A[:, c] /= A[i, c]
+        for k in range(cols):
+            if k != c:
+                A[:, k] -= A[i, k] * A[:, c]
+        pivots.append(i)
+        c += 1
+    return A[:, : len(pivots)], pivots
+
+
+def _first_moment(y, nvars, i):
+    e = [0] * nvars
+    e[i] = 1
+    return y.get(tuple(e), np.nan)
+
+
+def _lambda_min(arr, x):
+    m = arr.shape[0]
+    M = np.array([[arr[i, j](x) for j in range(m)] for i in range(m)])
+    return float(np.linalg.eigvalsh((M + M.T) / 2).min())
+
+
+def _violation_fn(norm_ineqs, eqs):
+    """``x -> max violation`` of scalar/matrix inequalities and equalities."""
+
+    def fn(x):
+        v = 0.0
+        for kind, g in norm_ineqs:
+            val = g(x) if kind == "scalar" else _lambda_min(g.arr, x)
+            v = max(v, -val)
+        for h in eqs:
+            v = max(v, abs(h(x)))
+        return v
+
+    return fn
+
+
+class _RecordSource:
+    """Moment source for certificates compiled outside SOS/SOSMatrix."""
+
+    def __init__(self, diag_records, nvars):
+        self.diag_records = diag_records
+        self.nvars = nvars
+
+    def moments(self):
+        return normalized_moments(self.diag_records, self.nvars)
 
 
 def _matrix_localizer(nvars, size, basis, G):
@@ -243,6 +473,7 @@ def _pmi_optimize_ts(F, norm_ineqs, d, ts, ts_order, solver, verbose, solver_kwa
         grams_k.append(grams)
 
     constraints = []
+    diag_records = [{} for _ in range(p)]
     for i in range(p):
         for j in range(i, p):
             rhs = F.arr[i, j]
@@ -255,6 +486,7 @@ def _pmi_optimize_ts(F, norm_ineqs, d, ts, ts_order, solver, verbose, solver_kwa
                     lhs.get((i, j), {}),
                     rhs.terms,
                     "PMI certificate entry (%d, %d)" % (i, j),
+                    record=diag_records[i] if i == j else None,
                 )
             )
 
@@ -271,6 +503,9 @@ def _pmi_optimize_ts(F, norm_ineqs, d, ts, ts_order, solver, verbose, solver_kwa
         multipliers=grams_k[1:],
         ts_order=steps,
         ts_block_sizes=[[len(b) for b in blocks] for blocks in blocks_k],
+        moment_source=_RecordSource(diag_records, F.nvars),
+        evaluate_fn=lambda x: _lambda_min(F.arr, x),
+        violation_fn=_violation_fn(norm_ineqs, []),
     )
 
 
@@ -436,6 +671,9 @@ def pmi_optimize(
         multipliers=multipliers,
         eq_multipliers=eq_multipliers,
         var_cliques=var_cliques,
+        moment_source=cert,
+        evaluate_fn=lambda x: _lambda_min(F.arr, x),
+        violation_fn=_violation_fn(norm_ineqs, eqs),
     )
 
 
@@ -669,4 +907,7 @@ def sos_lower_bound(
         t=t,
         multipliers=multipliers,
         eq_multipliers=eq_multipliers,
+        moment_source=con,
+        evaluate_fn=f,
+        violation_fn=_violation_fn([("scalar", g) for g in ineqs], eqs),
     )

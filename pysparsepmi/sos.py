@@ -227,12 +227,21 @@ class SOS:
         self.bases = None
         self.grams = None
         self.blocks = None
+        self.moment_constraints = None
 
     @property
     def block_sizes(self):
         if self.grams is None:
             return None
         return [0 if Q is None else Q.shape[0] for Q in self.grams]
+
+    @property
+    def nvars(self):
+        return self.poly.nvars
+
+    def moments(self):
+        """Normalized pseudo-moments ``{exponent: y}`` (after solving)."""
+        return normalized_moments([self.moment_constraints or {}], self.nvars)
 
     def compile(self):
         return _compile_sos(self)
@@ -287,12 +296,29 @@ class SOSMatrix:
         self.grams = None
         self.blocks = None
         self.block_pairs = None
+        self.moment_constraints = None
 
     @property
     def block_sizes(self):
         if self.grams is None:
             return None
         return [0 if Q is None else Q.shape[0] for Q in self.grams]
+
+    @property
+    def nvars(self):
+        return self.P.nvars
+
+    def moments(self):
+        """Normalized scalar pseudo-moments ``trace(Y_gamma) / trace(Y_0)``.
+
+        The duals of the entry-wise coefficient constraints form matrix-valued
+        moments ``Y_gamma``; at an optimal point of a ``lambda_min`` problem
+        they concentrate on ``x*`` with weight ``u u'`` (``u`` a minimizing
+        eigenvector), so the trace-normalized first moments recover ``x*``.
+        """
+        rec = self.moment_constraints or {}
+        m = self.P.shape[0]
+        return normalized_moments([rec.get((i, i), {}) for i in range(m)], self.nvars)
 
     def compile(self):
         return _compile_sos_matrix(self)
@@ -358,11 +384,13 @@ def sos_matrix_variable(nvars, size, basis):
 # ======================================================================
 # Compilation to CVXPY constraints
 # ======================================================================
-def _match_coefficients(lhs, rhs_poly_terms, context):
+def _match_coefficients(lhs, rhs_poly_terms, context, record=None):
     """Equate Gram-expansion coefficients with polynomial coefficients.
 
     ``lhs`` maps exponent tuples to lists of CVXPY scalar expressions;
     ``rhs_poly_terms`` maps exponent tuples to numeric or CVXPY coefficients.
+    If ``record`` is a dict, the equality constraint of every monomial is
+    stored in it: their dual variables are the (pseudo-)moments.
     """
     constraints = []
     for gamma in set(lhs) | set(rhs_poly_terms):
@@ -370,6 +398,8 @@ def _match_coefficients(lhs, rhs_poly_terms, context):
         rhs = rhs_poly_terms.get(gamma, 0.0)
         if exprs:
             constraints.append(sum(exprs) == rhs)
+            if record is not None:
+                record[gamma] = constraints[-1]
         elif _is_number(rhs):
             if rhs != 0:
                 raise SOSInfeasibleError(
@@ -378,7 +408,30 @@ def _match_coefficients(lhs, rhs_poly_terms, context):
                 )
         else:
             constraints.append(rhs == 0)
+            if record is not None:
+                record[gamma] = constraints[-1]
     return constraints
+
+
+def normalized_moments(records, nvars):
+    """Pseudo-moments ``y_gamma`` from the duals of coefficient constraints.
+
+    ``records`` is a list of ``{gamma: constraint}`` dicts (one per diagonal
+    entry of a matrix certificate, whose duals are summed: the trace of the
+    matrix-valued moments). The result is normalized so that ``y_0 = 1``,
+    which also fixes the sign convention of the solver's duals.
+    """
+    acc = defaultdict(float)
+    for rec in records:
+        for g, c in rec.items():
+            v = c.dual_value
+            if v is None:
+                raise ValueError("dual values are not available (problem not solved?)")
+            acc[g] += float(np.asarray(v).reshape(()))
+    y0 = acc.get((0,) * nvars, 0.0)
+    if abs(y0) < 1e-12:
+        raise ValueError("the zeroth moment vanishes; cannot normalize")
+    return {g: v / y0 for g, v in acc.items()}
 
 
 def _compile_sos(con):
@@ -423,7 +476,8 @@ def _compile_sos(con):
                 for b in range(a, len(BB)):
                     gamma = tuple(x + y for x, y in zip(BB[a], BB[b]))
                     lhs[gamma].append(Q[a, b] if a == b else 2 * Q[a, b])
-    return _match_coefficients(lhs, p.terms, "SOS")
+    con.moment_constraints = {}
+    return _match_coefficients(lhs, p.terms, "SOS", record=con.moment_constraints)
 
 
 def _compile_sos_matrix(con):
@@ -459,6 +513,7 @@ def _compile_sos_matrix(con):
         con.cliques = [[0]]
         con.bases, con.grams, con.blocks = inner.bases, inner.grams, inner.blocks
         con.block_pairs = [([0], V) for V in inner.cliques]
+        con.moment_constraints = {(0, 0): inner.moment_constraints}
         return out
 
     nonzero = [(i, j) for i in range(m) for j in range(m) if not P[i, j].is_zero()]
@@ -544,11 +599,13 @@ def _compile_sos_matrix(con):
                         dest[gamma].append(Q[a * mk + ii, b * mk + jj])
 
     constraints = []
+    con.moment_constraints = {}
     entries = set(lhs) | {(i, j) for i, j in nonzero if i <= j}
     for i, j in sorted(entries):
         constraints.extend(
             _match_coefficients(
-                lhs.get((i, j), {}), P[i, j].terms, "SOSMatrix entry (%d, %d)" % (i, j)
+                lhs.get((i, j), {}), P[i, j].terms, "SOSMatrix entry (%d, %d)" % (i, j),
+                record=con.moment_constraints.setdefault((i, j), {}),
             )
         )
     return constraints

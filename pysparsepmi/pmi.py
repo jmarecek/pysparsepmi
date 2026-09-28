@@ -32,6 +32,7 @@ from .sos import (
     SOS,
     SOSMatrix,
     _match_coefficients,
+    free_poly_variable,
     sos_matrix_variable,
     sos_poly_variable,
 )
@@ -51,7 +52,8 @@ class PMIResult:
     ``block_sizes`` are the PSD block sizes of the SOS certificate. With
     term sparsity, ``ts_order`` is the number of support-extension steps
     actually performed and ``ts_block_sizes[k]`` lists the Gram block sizes
-    of constraint ``k`` (``k = 0`` is the certificate itself).
+    of constraint ``k`` (``k = 0`` is the certificate itself). For lifted
+    (composition) relaxations, ``ranks`` are the state dimensions ``r_i``.
     """
 
     value: Optional[float]
@@ -64,6 +66,8 @@ class PMIResult:
     multipliers: Any = field(repr=False, default=None)
     ts_order: Optional[int] = None
     ts_block_sizes: Optional[List[List[int]]] = None
+    eq_multipliers: Any = field(repr=False, default=None)
+    ranks: Optional[List[int]] = None
 
 
 def _matrix_localizer(nvars, size, basis, G):
@@ -267,6 +271,16 @@ def _pmi_optimize_ts(F, norm_ineqs, d, ts, ts_order, solver, verbose, solver_kwa
     )
 
 
+def _hosts(cliques, vars_, mode):
+    """Cliques that receive a multiplier for a constraint on ``vars_``."""
+    hosts = [c for c in cliques if vars_ <= set(c)]
+    if not hosts:
+        return [sorted(set().union(*map(set, cliques)))]
+    if mode == "one":
+        return [min(hosts, key=len)]
+    return hosts
+
+
 def pmi_optimize(
     F,
     ineqs=(),
@@ -416,6 +430,9 @@ def sos_lower_bound(
     ineqs=(),
     order=None,
     sparse=True,
+    eqs=(),
+    cliques=None,
+    multiplier_hosts="all",
     ts=None,
     ts_order=None,
     solver="SCS",
@@ -431,6 +448,17 @@ def sos_lower_bound(
     and each constraint ``g_j`` receives one multiplier per clique containing
     all its variables (Waki et al. 2006).
 
+    Equality constraints ``h = 0`` in ``eqs`` enter through free polynomial
+    multipliers ``tau_{h,k}`` of degree ``2*order - deg(h)`` in the variables
+    of every clique ``k`` that contains all variables of ``h``, i.e.
+    ``f - t = s_0 + sum_j g_j * s_{j,k} + sum_h tau_{h,k} * h``. ``cliques``
+    overrides the automatic correlative-sparsity cliques (every constraint
+    should then be supported on at least one of them).
+    ``multiplier_hosts="one"`` gives each constraint a single multiplier on
+    the smallest clique containing it (as in the SL-chord/LRPOP
+    hierarchies) instead of one per containing clique (``"all"``), which
+    avoids redundant multipliers when many cliques overlap.
+
     With ``ts`` set ("block" or "MD"), the scalar term-sparsity (TSSOS)
     relaxation is used instead: Gram matrices of ``s_0`` and of every
     multiplier are split into blocks along the cliques of the term sparsity
@@ -441,8 +469,13 @@ def sos_lower_bound(
         raise TypeError("f must be a Polynomial")
     n = f.nvars
     ineqs = [as_polynomial(g, n) for g in ineqs]
+    eqs = [as_polynomial(h, n) for h in eqs]
 
+    if multiplier_hosts not in ("all", "one"):
+        raise ValueError("multiplier_hosts must be 'all' or 'one'")
     if ts is not None:
+        if eqs or cliques is not None:
+            raise NotImplementedError("eqs and cliques are not supported together with ts")
         d_min = max([_half(f.degree())] + [_half(g.degree()) for g in ineqs] + [1])
         d = d_min if order is None else int(order)
         if d < d_min:
@@ -460,15 +493,23 @@ def sos_lower_bound(
             solver_kwargs,
         )
 
-    d_min = max([_half(f.degree())] + [_half(g.degree()) for g in ineqs] + [1])
+    d_min = max(
+        [_half(f.degree())]
+        + [_half(g.degree()) for g in ineqs]
+        + [_half(h.degree()) for h in eqs]
+        + [1]
+    )
     d = d_min if order is None else int(order)
     if d < d_min:
         raise ValueError("order=%d is below the minimum valid order %d" % (d, d_min))
 
-    if sparse:
+    if cliques is not None:
+        cliques = [sorted(int(v) for v in c) for c in cliques]
+        sparse = True
+    elif sparse:
         # correlative sparsity from f, plus a clique per constraint
         exponents = list(f.terms)
-        for g in ineqs:
+        for g in list(ineqs) + list(eqs):
             e = [0] * n
             for i in g.variables():
                 e[i] = 1
@@ -483,7 +524,7 @@ def sos_lower_bound(
     multipliers = []
     for g in ineqs:
         gv = set(g.variables())
-        hosts = [c for c in cliques if gv <= set(c)] or [sorted(set().union(*map(set, cliques)))]
+        hosts = _hosts(cliques, gv, multiplier_hosts)
         d_loc = d - _half(g.degree())
         per_clique = []
         for c in hosts:
@@ -492,6 +533,18 @@ def sos_lower_bound(
             cert = cert - g * s
             per_clique.append(Q)
         multipliers.append(per_clique)
+
+    eq_multipliers = []
+    for h in eqs:
+        hv = set(h.variables())
+        hosts = _hosts(cliques, hv, multiplier_hosts)
+        deg_tau = 2 * d - h.degree()
+        per_clique = []
+        for c in hosts:
+            tau, coeffs = free_poly_variable(n, monomials(n, deg_tau, vars=c))
+            cert = cert - tau * h
+            per_clique.append(coeffs)
+        eq_multipliers.append(per_clique)
 
     con = SOS(cert, cliques=cliques if sparse else None, sparse=sparse)
     problem = Problem(cp.Maximize(t), [con])
@@ -505,4 +558,5 @@ def sos_lower_bound(
         problem=problem,
         t=t,
         multipliers=multipliers,
+        eq_multipliers=eq_multipliers,
     )

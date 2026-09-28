@@ -61,19 +61,33 @@ def _adjacency(pattern, n=None):
     return adj
 
 
-def chordal_cliques(pattern, n=None):
+def chordal_cliques(pattern, n=None, order=None):
     """Maximal cliques of a chordal extension of a sparsity pattern.
 
     The extension is produced by symbolic Gaussian elimination with a greedy
     minimum-degree ordering (ties broken by vertex index, so the result is
     deterministic). Returns a sorted list of cliques, each a sorted list of
     0-based vertex indices. Isolated vertices yield singleton cliques.
+
+    ``order`` optionally fixes the elimination order: its vertices are
+    eliminated first, in the given sequence, and any remaining vertices by
+    minimum degree. Structured problems often have a known order that beats
+    the greedy heuristic, e.g. the column-by-column order of Theorem 3.3 of
+    arXiv:2512.08394, which attains the treewidth ``r + 1`` of lifted
+    low-rank (CP) graphs where minimum degree does not.
     """
     adj = _adjacency(pattern, n)
     remaining = set(adj)
+    forced = [] if order is None else [int(v) for v in order]
+    if len(set(forced)) != len(forced) or not set(forced) <= remaining:
+        raise ValueError("order must list distinct vertices of the pattern")
+    forced.reverse()
     candidates = []
     while remaining:
-        v = min(remaining, key=lambda u: (len(adj[u]), u))
+        if forced:
+            v = forced.pop()
+        else:
+            v = min(remaining, key=lambda u: (len(adj[u]), u))
         nb = adj[v]
         candidates.append(frozenset(nb | {v}))
         # eliminate v: connect its neighbourhood into a clique (fill-in)

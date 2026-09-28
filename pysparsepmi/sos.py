@@ -297,6 +297,20 @@ def sos_poly_variable(nvars, basis):
     return S[0, 0], Q
 
 
+def free_poly_variable(nvars, basis):
+    """A polynomial with free coefficients over the given monomial basis.
+
+    Returns ``(p, c)`` where ``c`` is a CVXPY vector variable and ``p`` has
+    coefficient ``c[j]`` on ``basis[j]``; used for ideal multipliers of
+    equality constraints and for push-forward potentials.
+    """
+    basis = [tuple(b) for b in basis]
+    if not basis:
+        raise ValueError("empty basis")
+    c = cp.Variable(len(basis))
+    return Polynomial(nvars, {b: c[j] for j, b in enumerate(basis)}), c
+
+
 def sos_matrix_variable(nvars, size, basis):
     """An SOS-matrix "variable" of the given size over an x-monomial basis.
 

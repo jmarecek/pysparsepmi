@@ -17,6 +17,7 @@ __all__ = [
     "as_polynomial",
     "poly_matrix",
     "ball_multiplier",
+    "compose",
 ]
 
 
@@ -124,6 +125,23 @@ class Polynomial:
 
     def is_numeric(self):
         return all(_is_number(c) for c in self.terms.values())
+
+    def embed(self, nvars, index_map):
+        """Copy of ``self`` in a larger space of ``nvars`` variables.
+
+        Variable ``i`` of ``self`` becomes variable ``index_map[i]``.
+        """
+        index_map = [int(j) for j in index_map]
+        if len(index_map) != self.nvars:
+            raise ValueError("index_map must have length %d" % self.nvars)
+        terms = {}
+        for e, c in self.terms.items():
+            expo = [0] * nvars
+            for i, ei in enumerate(e):
+                if ei:
+                    expo[index_map[i]] += ei
+            terms[tuple(expo)] = c
+        return Polynomial(nvars, terms)
 
     # ------------------------------------------------------------------
     # arithmetic
@@ -337,6 +355,42 @@ def poly_matrix(M, nvars=None):
     for idx in np.ndindex(arr.shape):
         arr[idx] = as_polynomial(arr[idx], nvars)
     return arr
+
+
+def compose(p, subs):
+    """Substitute ``subs[i]`` for variable ``i`` of ``p``: ``p(subs[0], ...)``.
+
+    ``subs`` are Polynomials sharing one variable space (numbers are
+    accepted as constants). ``p`` may have CVXPY coefficients as long as the
+    substituted polynomials are numeric, so ``compose(V, F)`` of a
+    parametric potential ``V`` with a numeric map ``F`` stays affine.
+    """
+    subs = list(subs)
+    if len(subs) != p.nvars:
+        raise ValueError("expected %d substitutions, got %d" % (p.nvars, len(subs)))
+    target = None
+    for q in subs:
+        if isinstance(q, Polynomial):
+            target = q.nvars
+            break
+    if target is None:
+        raise ValueError("cannot infer the target space: no Polynomial in subs")
+    subs = [as_polynomial(q, target) for q in subs]
+    powers = [[Polynomial.constant(target, 1.0)] for _ in subs]
+
+    def power(i, k):
+        while len(powers[i]) <= k:
+            powers[i].append(powers[i][-1] * subs[i])
+        return powers[i][k]
+
+    out = Polynomial.zero(target)
+    for e, c in p.terms.items():
+        mono = Polynomial.constant(target, 1.0)
+        for i, ei in enumerate(e):
+            if ei:
+                mono = mono * power(i, ei)
+        out = out + mono * c
+    return out
 
 
 def ball_multiplier(nvars, nu, vars=None):

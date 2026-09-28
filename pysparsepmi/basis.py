@@ -88,21 +88,17 @@ def reduce_bases(bases, support):
     changed = True
     while changed:
         changed = False
+        # sums b + c of distinct pairs within one basis, over all bases
+        pair_sums = set()
+        for B in sets:
+            Bl = list(B)
+            for a in range(len(Bl)):
+                for b in range(a + 1, len(Bl)):
+                    pair_sums.add(tuple(x + y for x, y in zip(Bl[a], Bl[b])))
         for B in sets:
             for alpha in list(B):
                 dbl = tuple(2 * a for a in alpha)
-                if dbl in target:
-                    continue
-                found = False
-                for B2 in sets:
-                    for beta in B2:
-                        gamma = tuple(d - b for d, b in zip(dbl, beta))
-                        if gamma != beta and all(g >= 0 for g in gamma) and gamma in B2:
-                            found = True
-                            break
-                    if found:
-                        break
-                if not found:
+                if dbl not in target and dbl not in pair_sums:
                     B.discard(alpha)
                     changed = True
     return [sorted(B, key=lambda t: (sum(t), t)) for B in sets]

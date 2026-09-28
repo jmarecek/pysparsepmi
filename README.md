@@ -11,9 +11,17 @@ The methods implemented here are based on:
 - J. Miller, J. Wang, F. Guo, *Sparse Polynomial Matrix Optimization*
   ([arXiv:2411.15479](https://arxiv.org/abs/2411.15479)),
 
+- L. Balada Gaggioli, D. Henrion, M. Korda, *Global optimization of
+  low-rank polynomials* ([arXiv:2512.08394](https://arxiv.org/abs/2512.08394)),
+- L. Balada Gaggioli, D. Henrion, M. Korda, *Composition and tensor train
+  structure in polynomial optimization*
+  ([arXiv:2604.17563](https://arxiv.org/abs/2604.17563)),
+
 with implementation reference to the accompanying
 [sos-chordal-decomposition-pmi](https://github.com/aeroimperial-optimization/sos-chordal-decomposition-pmi)
-code and [TSSOS](https://github.com/wangjie212/TSSOS).
+code, [TSSOS](https://github.com/wangjie212/TSSOS), and the Julia packages
+[LRPOP](https://github.com/llorebaga/LRPOP) and
+[SLPOP](https://github.com/llorebaga/SLPOP).
 
 The modelling layer is deliberately close to
 [CVXPY's LMI API](https://www.cvxpy.org/api_reference/cvxpy.constraints.html#psd):
@@ -128,6 +136,65 @@ dense bound of the same relaxation order at stabilization
 (`ts_order=None`). The same keywords work on constraint objects
 (`SOS(p, ts=...)`, `SOSMatrix(P, ts=...)`) and on `sos_lower_bound`.
 
+### Composition, tensor-train and low-rank structure (state lifting)
+
+Many dense polynomials are evaluated through a chain of low-dimensional
+maps, `s_1 = F_1(x_1)`, `s_i = F_i(s_{i-1}, x_i)`, `p = F_n(s_{n-1}, x_n)`:
+dynamical systems, Markov chains, neural networks, tensor trains, and
+low-rank (CP) polynomials. Lifting the states `s_i` to variables tied to `x`
+by equalities makes the problem chain-sparse, so PSD blocks depend on the
+state dimensions (ranks) `r_i` and not on `n`:
+
+```python
+# controlled 2-state Markov chain (arXiv:2604.17563, Sec. 7.1)
+a = lambda x: 0.95 - 0.2 * x**2
+b = lambda x: 0.05 - 0.05 * x**2
+maps = ([lambda s, x: [a(x), 1 - a(x)]]
+        + [lambda s, x: [s[0]*a(x) + s[1]*b(x), s[0]*(1 - a(x)) + s[1]*(1 - b(x))]] * 8
+        + [lambda s, x: s[0]*a(x) + s[1]*b(x)])
+res = psp.composition_lower_bound(maps, box=1.0, order=2, sense="max")
+res.value, res.ranks, res.block_sizes   # ~0.67434; exact max is 1/2 + 0.9^10/2
+```
+
+Each map receives the previous state (a list of polynomials) and the local
+variable, and returns the new state; ranks are inferred. Two hierarchies are
+available:
+
+- `method="chord"` (SL-chord): lifted correlative sparsity, with the
+  stage-by-stage elimination order of the papers, so cliques have
+  `r_i + r_{i+1} + 1` variables (`r + 2` for rank-`r` CP polynomials —
+  the LRPOP hierarchy).
+- `method="push"` (SL-push): push-forward potentials `V_i(s_i)` with one
+  certificate per stage on `r_{i-1} + 1` variables, at the price of higher
+  degrees (`deg V_i = floor(2*order / deg F_i)`).
+
+Front-ends take polynomials in tensor formats (TensorLy layouts, so the output
+of `tensorly.decomposition.parafac` / `tensor_train` on a coefficient tensor
+plugs in):
+
+```python
+psp.cp_lower_bound(factors, box=1.0, order=2)                 # factors[i]: (deg+1, r)
+psp.cp_lower_bound(factors, box=1.0, basis="bernstein")       # Bernstein coefficients
+psp.tt_lower_bound(cores, box=1.0, order=2, method="push")    # cores[i]: (r_{i-1}, deg+1, r_i)
+```
+
+With a `box`, redundant bounds on the states are derived by interval
+arithmetic (as the papers add for convergence) and every state is rescaled by
+its bound (`scale=True`), an exact change of variables that keeps the SDP
+well conditioned. Vector-valued local variables (`xdims`) and extra local
+constraints (`local_ineqs`, `local_eqs`) are supported.
+
+> **Solver note** — on long chains SCS needs many iterations
+> (`max_iters=200000` or more). A result with status
+> `optimal_inaccurate` is not a certified bound, and can even exceed the
+> true optimum; MOSEK is much faster and more accurate at scale.
+
+The underlying building blocks are also exposed: `sos_lower_bound(...,
+eqs=[h, ...], cliques=..., multiplier_hosts="one")` for equality
+constraints and user-given cliques, `chordal_cliques(pattern, order=...)`
+for a prescribed elimination order, and `compose` / `Polynomial.embed`
+for substitution and variable-space changes.
+
 ## API summary
 
 | Function / class | Purpose |
@@ -139,16 +206,23 @@ dense bound of the same relaxation order at stabilization
 | `Problem(objective, constraints).solve()` | CVXPY-style problem wrapper |
 | `pmi_optimize(F, ineqs, order=d, ts=..., ts_order=s)` | lower-bound `lambda_min(F)` on a semialgebraic set |
 | `sos_lower_bound(f, ineqs, order=d, ts=..., ts_order=s)` | sparse Lasserre lower bound for scalar polynomials |
-| `chordal_cliques(pattern)` | maximal cliques of a chordal extension |
+| `sos_lower_bound(f, ineqs, eqs=[...], cliques=...)` | ... with equality constraints and user-given cliques |
+| `composition_lower_bound(maps, box, method="chord"/"push")` | state-lifting bounds for chained polynomial maps (SL-chord / SL-push) |
+| `cp_lower_bound(factors, ...)`, `tt_lower_bound(cores, ...)` | LRPOP for CP polynomials, state lifting for tensor trains |
+| `chordal_cliques(pattern, order=...)` | maximal cliques of a chordal extension (optional elimination order) |
 | `correlative_sparsity(polys)` | correlative sparsity pattern of a set of polynomials |
 
 Low-level building blocks: `sos_poly_variable` / `sos_matrix_variable` create
 Gram-parameterized SOS multipliers, `monomials`, `gram_candidates`,
-`reduce_bases` handle basis generation and Newton-style reduction.
+`reduce_bases` handle basis generation and Newton-style reduction,
+`free_poly_variable` creates polynomials with free coefficients, and
+`compose` substitutes polynomials into polynomials.
 
 **Scope notes.** This package implements *correlative/matrix* (clique)
-sparsity and *term* sparsity (block closure and minimum-degree chordal
-closure), and provides bounds only (no moment-side solution extraction).
+sparsity, *term* sparsity (block closure and minimum-degree chordal
+closure) and *state lifting* for composition, tensor-train and CP structure
+(scalar objectives), and provides bounds only (no moment-side solution
+extraction).
 
 ## Examples
 
@@ -165,6 +239,12 @@ closure), and provides bounds only (no moment-side solution extraction).
 - `examples/banded_pmi.py` — banded parametric PMI in the style of Example
   5.1 of Zheng & Fantuzzi, comparing sparse clique blocks against the dense
   certificate.
+- `examples/low_rank_pop.py` — LRPOP on the well-conditioned rank-2
+  Bernstein instances of arXiv:2512.08394 (Sec. 4.2): the exact minimum
+  `r` for `n` up to 20 (total degree 40) with a constant 15x15 PSD block.
+- `examples/markov_chain_composition.py` — certified upper bounds for a
+  controlled two-state Markov chain (arXiv:2604.17563, Sec. 7.1), SL-chord
+  versus SL-push, against the closed form `1/2 + 0.9^n/2`.
 - `examples/sparse_pop.py` — chained scalar polynomial optimization with
   correlative sparsity (20 variables, cliques of size 2).
 
@@ -184,6 +264,10 @@ Run the tests with `python tests/test_pysparsepmi.py` (or `pytest`).
 5. W. Parvaiz, J. Aspman, A. Wodecki, G. Korpas, J. Marecek (2025).
    Identifiability of autonomous and controlled open quantum systems.
    arXiv:2501.05270.
+6. L. Balada Gaggioli, D. Henrion, M. Korda (2025). Global optimization of
+   low-rank polynomials. arXiv:2512.08394.
+7. L. Balada Gaggioli, D. Henrion, M. Korda (2026). Composition and tensor
+   train structure in polynomial optimization. arXiv:2604.17563.
 
 ## Appendix: correspondence with YALMIP and TSSOS
 
@@ -198,5 +282,7 @@ Run the tests with `python tests/test_pysparsepmi.py` (or `pytest`).
 | `pmi_optimize(..., ts="MD", ts_order=s)` | — | `tssos(F, G, x, d, TS="MD")`, then `tssos(data, TS="MD")` |
 | `sos_lower_bound(f, ineqs, order=d)` | `solvesos` + `sos.csp` | `cs_tssos(f, g, x, d)` (CS only) |
 | `sos_lower_bound(..., ts="block")` | — | `tssos(f, g, x, d, TS="block")` |
+| `cp_lower_bound(factors, method="chord")` | — | LRPOP.jl |
+| `composition_lower_bound(maps, method="chord"/"push")` | — | SLPOP.jl (SL-chord / SL-push) |
 | `chordal_cliques(pattern)` | `cliquesFromSpMatD.m` | `clique_decomp` |
 | `correlative_sparsity(polys)` | `corrsparsity.m` | — |

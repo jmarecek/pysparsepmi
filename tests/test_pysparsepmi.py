@@ -297,6 +297,117 @@ def test_polynomial_evaluation_and_value():
     assert abs(p.value()(np.array([2.0])) - 10.0) < 1e-12
 
 
+# ----------------------------------------------------------------------
+# equality constraints, elimination orders, lifting (LRPOP / SL-chord / SL-push)
+# ----------------------------------------------------------------------
+def _cp_graph_edges(r, n):
+    # x_i -> i, t_{l,i} -> n + l*n + i; h_{l,i} couples t_{l,i}, t_{l,i-1}, x_i
+    edges = []
+    for l in range(r):
+        edges.append((n + l * n, 0))
+        for i in range(1, n):
+            a, b, c = n + l * n + i, n + l * n + i - 1, i
+            edges += [(a, b), (a, c), (b, c)]
+    return edges, n + r * n
+
+
+def test_chordal_cliques_elimination_order():
+    r, n = 4, 12
+    edges, N = _cp_graph_edges(r, n)
+    greedy = max(len(c) for c in psp.chordal_cliques(edges, n=N))
+    order = []
+    for i in reversed(range(n)):
+        order += [n + l * n + i for l in range(r)] + [i]
+    cl = psp.chordal_cliques(edges, n=N, order=order)
+    assert max(len(c) for c in cl) == r + 2  # Theorem 3.3 of arXiv:2512.08394
+    assert greedy > r + 2
+
+
+def test_embed_and_compose():
+    x, y = psp.polyvar(2)
+    p = psp.compose(x**2 * y + 3 * x, [x + y, x * y])
+    q = (x + y) ** 2 * (x * y) + 3 * (x + y)
+    assert p.equals(q)
+    e = (x * y**2).embed(4, [3, 1])
+    assert e.terms == {(0, 2, 0, 1): 1.0}
+
+
+def test_sos_lower_bound_equality():
+    x, y = psp.polyvar(2)
+    res = psp.sos_lower_bound(x + y, eqs=[x**2 + y**2 - 1], **SOLVER_OPTS)
+    assert abs(res.value + np.sqrt(2)) < TOL, res.value
+    assert len(res.eq_multipliers) == 1
+
+
+def _lrpop_example():
+    # Example 3.1 of arXiv:2512.08394 (rank 2, n = 5), minimum -180 on [-1, 1]^5
+    return [
+        np.array([[1, -1], [2, 1]]),
+        np.array([[-2, 0], [1, 2]]),
+        np.array([[0, 1], [-1, 3]]),
+        np.array([[3, 0], [1, -1]]),
+        np.array([[2, 1], [-3, -1]]),
+    ]
+
+
+def test_lrpop_chord_example31():
+    res = psp.cp_lower_bound(_lrpop_example(), box=1.0, order=2, method="chord", **SOLVER_OPTS)
+    assert max(len(c) for c in res.cliques) == 4  # r + 2
+    assert res.ranks == [2, 2, 2, 2]
+    assert abs(res.value + 180) < 180 * TOL, res.value
+
+
+def test_lrpop_push_example31():
+    res = psp.cp_lower_bound(_lrpop_example(), box=1.0, order=2, method="push", **SOLVER_OPTS)
+    assert max(len(c) for c in res.cliques) == 3  # r + 1
+    assert abs(res.value + 180) < 180 * TOL, res.value
+
+
+def _markov_maps(n):
+    a = lambda x: 0.95 - 0.20 * x**2
+    b = lambda x: 0.05 - 0.05 * x**2
+    first = lambda s, x: [a(x), 1 - a(x)]
+    step = lambda s, x: [s[0] * a(x) + s[1] * b(x), s[0] * (1 - a(x)) + s[1] * (1 - b(x))]
+    last = lambda s, x: s[0] * a(x) + s[1] * b(x)
+    return [first] + [step] * (n - 2) + [last]
+
+
+def test_markov_chain_chord_exact():
+    # Section 7.1 of arXiv:2604.17563: max Pr(working at n) = 1/2 + 0.9^n / 2
+    n = 5
+    res = psp.composition_lower_bound(
+        _markov_maps(n), box=1.0, order=2, sense="max", **SOLVER_OPTS
+    )
+    assert abs(res.value - (0.5 + 0.5 * 0.9**n)) < TOL, res.value
+
+
+def test_markov_chain_push_valid():
+    n = 5
+    res = psp.composition_lower_bound(
+        _markov_maps(n), box=1.0, order=2, sense="max", method="push", **SOLVER_OPTS
+    )
+    exact = 0.5 + 0.5 * 0.9**n
+    assert exact - TOL <= res.value <= exact + 0.05, res.value
+
+
+def test_tt_matches_vertex_minimum():
+    # multilinear TT polynomial: the box minimum is attained at a vertex
+    import itertools
+
+    rng = np.random.RandomState(1)
+    ranks = [1, 2, 2, 1]
+    cores = [rng.randn(ranks[i], 2, ranks[i + 1]) for i in range(3)]
+
+    def val(v):
+        row = np.ones((1, 1))
+        for i in range(3):
+            row = row @ (cores[i][:, 0, :] + cores[i][:, 1, :] * v[i])
+        return row[0, 0]
+
+    brute = min(val(v) for v in itertools.product([-1, 1], repeat=3))
+    res = psp.tt_lower_bound(cores, box=1.0, order=2, **SOLVER_OPTS)
+    assert abs(res.value - brute) < 10 * TOL * max(1.0, abs(brute)), (res.value, brute)
+
 if __name__ == "__main__":
     import sys
     import traceback

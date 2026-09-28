@@ -10,7 +10,10 @@ A Python port of the sparse-PMI machinery from
   matrix optimization (the ``ts=``/``ts_order=`` options, mirroring
   TSSOS's ``TS=`` keyword), and
 * the polynomial-matrix examples of TSSOS (wangjie212/TSSOS,
-  ``example/pmi.jl``).
+  ``example/pmi.jl``), and
+* Balada Gaggioli, Henrion & Korda: state lifting for low-rank (CP)
+  polynomials (LRPOP, arXiv:2512.08394) and for composition / tensor-train
+  structure (SL-chord and SL-push, arXiv:2604.17563).
 
 The modelling API mirrors CVXPY's LMI interface: build polynomial matrices,
 write ``P >> 0`` to obtain a (chordally decomposed) SOS-matrix constraint,
@@ -23,6 +26,7 @@ from .polynomial import (
     as_polynomial,
     poly_matrix,
     ball_multiplier,
+    compose,
 )
 from .chordal import chordal_cliques, correlative_sparsity
 from .basis import monomials, gram_candidates, reduce_bases
@@ -35,8 +39,10 @@ from .sos import (
     SOSInfeasibleError,
     sos_poly_variable,
     sos_matrix_variable,
+    free_poly_variable,
 )
 from .pmi import pmi_optimize, sos_lower_bound, PMIResult
+from .lifting import composition_lower_bound, cp_lower_bound, tt_lower_bound
 
 __version__ = "0.1.0"
 
@@ -46,6 +52,7 @@ __all__ = [
     "as_polynomial",
     "poly_matrix",
     "ball_multiplier",
+    "compose",
     "chordal_cliques",
     "correlative_sparsity",
     "monomials",
@@ -59,8 +66,12 @@ __all__ = [
     "SOSInfeasibleError",
     "sos_poly_variable",
     "sos_matrix_variable",
+    "free_poly_variable",
     "pmi_optimize",
     "sos_lower_bound",
     "PMIResult",
+    "composition_lower_bound",
+    "cp_lower_bound",
+    "tt_lower_bound",
     "__version__",
 ]

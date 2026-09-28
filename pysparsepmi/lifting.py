@@ -24,6 +24,12 @@ with states ``s_i`` of dimension ``r_i`` (the ranks / bond dimensions):
   certificate for ``p - t``. Blocks involve only ``r_{i-1} + dim(x_i)``
   variables, at the price of higher degrees.
 
+The last map may be matrix-valued, which extends both hierarchies to
+polynomial matrix inequalities (a pysparsepmi extension; the papers treat
+scalar objectives). The bounds remain valid, since the certificates
+telescope to ``F(x) - t I`` in the quadratic module on the feasible set;
+convergence of the matrix versions is not claimed.
+
 :func:`cp_lower_bound` and :func:`tt_lower_bound` build the chain for
 polynomials given in canonical polyadic (CP) or tensor-train (TT) format,
 using TensorLy's factor/core conventions.
@@ -42,9 +48,25 @@ import cvxpy as cp
 
 from .basis import monomials
 from .chordal import chordal_cliques
-from .pmi import PMIResult, _half, sos_lower_bound
+import numpy as np
+
+from .pmi import (
+    PMIResult,
+    _half,
+    _pmi_localize,
+    _row_cliques,
+    pmi_optimize,
+    sos_lower_bound,
+)
 from .polynomial import Polynomial, _is_number, as_polynomial, compose, polyvar
-from .sos import SOS, Problem, free_poly_variable, sos_poly_variable
+from .sos import (
+    SOS,
+    SOSMatrix,
+    PolyMatrix,
+    Problem,
+    free_poly_variable,
+    sos_poly_variable,
+)
 
 __all__ = ["composition_lower_bound", "cp_lower_bound", "tt_lower_bound"]
 
@@ -93,18 +115,45 @@ def _local_constraints(spec, xs, i):
 class _Stage:
     """One map ``F_i`` evaluated in its local space ``(s_{i-1}, x_i)``."""
 
-    def __init__(self, r_in, xdim, outputs, ineqs, eqs, box):
+    def __init__(self, r_in, xdim, outputs, ineqs, eqs, box, shape=None):
         self.r_in = r_in
         self.xdim = xdim
         self.nlocal = r_in + xdim
-        self.outputs = outputs
+        self.outputs = outputs  # state components, or matrix entries row-major
         self.ineqs = ineqs
         self.eqs = eqs
         self.box = box
+        self.shape = shape  # (m, m) for a matrix-valued last map, else None
 
     @property
     def degree(self):
         return max(p.degree() for p in self.outputs)
+
+    def matrix(self, sign=1.0):
+        """The matrix-valued output as an object array (times ``sign``)."""
+        m = self.shape[0]
+        arr = np.empty((m, m), dtype=object)
+        for a in range(m):
+            for b in range(m):
+                arr[a, b] = self.outputs[a * m + b] * sign
+        return arr
+
+
+def _as_matrix(out):
+    """Object array if ``out`` is matrix-like (PolyMatrix / 2-D), else None."""
+    if isinstance(out, PolyMatrix):
+        return out.arr
+    if isinstance(out, np.ndarray) and out.ndim == 2:
+        return out
+    if isinstance(out, (list, tuple)) and out and isinstance(
+        out[0], (list, tuple, np.ndarray)
+    ):
+        arr = np.empty((len(out), len(out[0])), dtype=object)
+        for a, row in enumerate(out):
+            for b, q in enumerate(row):
+                arr[a, b] = q
+        return arr
+    return None
 
 
 def _discover(maps, xdims, box, local_ineqs, local_eqs):
@@ -125,7 +174,14 @@ def _discover(maps, xdims, box, local_ineqs, local_eqs):
         v = polyvar(L)
         s, xs = v[:r_prev], v[r_prev:]
         out = F(s, xs[0] if k == 1 else xs)
-        if isinstance(out, Polynomial) or _is_number(out):
+        shape = None
+        arr = _as_matrix(out) if i == n - 1 else None
+        if arr is not None:
+            if arr.shape[0] != arr.shape[1]:
+                raise ValueError("the last stage must return a square matrix")
+            shape = arr.shape
+            out = list(arr.flat)
+        elif isinstance(out, Polynomial) or _is_number(out):
             out = [out]
         out = [as_polynomial(o, L) for o in out]
         if not out:
@@ -135,14 +191,16 @@ def _discover(maps, xdims, box, local_ineqs, local_eqs):
                 raise ValueError(
                     "stage %d must return numeric polynomials in its (s, x) variables" % i
                 )
-        if i == n - 1 and len(out) != 1:
-            raise ValueError("the last stage must return a single polynomial")
+        if i == n - 1 and shape is None and len(out) != 1:
+            raise ValueError(
+                "the last stage must return a single polynomial or a symmetric matrix"
+            )
         ineqs = [as_polynomial(g, L) for g in _local_constraints(local_ineqs, xs, i)]
         if boxes[i] is not None:
             lo, hi = boxes[i]
             ineqs += [(hi - x) * (x - lo) for x in xs]
         eqs = [as_polynomial(h, L) for h in _local_constraints(local_eqs, xs, i)]
-        stages.append(_Stage(r_prev, k, out, ineqs, eqs, boxes[i]))
+        stages.append(_Stage(r_prev, k, out, ineqs, eqs, boxes[i], shape))
         r_prev = len(out)
     return stages
 
@@ -252,9 +310,12 @@ def _rescale(stages, bounds):
     ivs = (bounds[-1] if n > 1 else []) + [last.box] * last.xdim
     if last.box is None:
         return 1.0
-    lo, hi = _interval(last.outputs[0], ivs)
-    c = max(abs(lo), abs(hi)) or 1.0
-    last.outputs = [last.outputs[0] * (1.0 / c)]
+    c = 0.0
+    for q in last.outputs:
+        lo, hi = _interval(q, ivs)
+        c = max(c, abs(lo), abs(hi))
+    c = c or 1.0
+    last.outputs = [q * (1.0 / c) for q in last.outputs]
     return c
 
 
@@ -289,11 +350,21 @@ def _chord(stages, bounds, sign, order, solver, verbose, solver_kwargs):
                 for l, (lo, hi) in enumerate(bounds[i]):
                     s = Polynomial.variable(N, idx_s[i][l])
                     ineqs.append((hi - s) * (s - lo))
-    objective = stages[-1].outputs[0].embed(N, local_map(n - 1)) * sign
+    last_map = local_map(n - 1)
+    if stages[-1].shape is None:
+        objective = stages[-1].outputs[0].embed(N, last_map) * sign
+        obj_entries = [objective]
+    else:
+        arr = stages[-1].matrix(sign)
+        for idx in np.ndindex(arr.shape):
+            arr[idx] = arr[idx].embed(N, last_map)
+        objective = PolyMatrix(arr)
+        obj_entries = list(arr.flat)
 
     groups = []
-    for e in objective.terms:
-        groups.append([j for j, ej in enumerate(e) if ej])
+    for q in obj_entries:
+        for e in q.terms:
+            groups.append([j for j, ej in enumerate(e) if ej])
     for q in ineqs + eqs:
         groups.append(q.variables())
     edges = [(a, b) for g in groups for a in g for b in g if a < b]
@@ -304,6 +375,18 @@ def _chord(stages, bounds, sign, order, solver, verbose, solver_kwargs):
         elim += idx_x[i]
     cliques = chordal_cliques(edges, n=N, order=elim)
 
+    if stages[-1].shape is not None:
+        return pmi_optimize(
+            objective,
+            ineqs=ineqs,
+            eqs=eqs,
+            order=order,
+            var_cliques=cliques,
+            multiplier_hosts="one",
+            solver=solver,
+            verbose=verbose,
+            **solver_kwargs
+        )
     return sos_lower_bound(
         objective,
         ineqs=ineqs,
@@ -346,14 +429,27 @@ def _push(stages, bounds, sign, order, solver, verbose, solver_kwargs):
         else:
             V = None
             lhs = st.outputs[0] * sign
-        if i == 0:
-            lhs = lhs - Polynomial.constant(L, t)
-        else:
-            lhs = lhs - V_prev.embed(L, range(st.r_in))
+        prev = Polynomial.constant(L, t) if i == 0 else V_prev.embed(L, range(st.r_in))
         local = list(st.ineqs)
         if i > 0 and bounds[i - 1] is not None:
             svars = polyvar(L)[: st.r_in]
             local += [(hi - s) * (s - lo) for s, (lo, hi) in zip(svars, bounds[i - 1])]
+        if st.shape is not None:
+            # matrix-valued last map: F_n(s, x) - V_{n-1}(s) I is an SOS
+            # matrix in the quadratic module (Scherer-Hol localizers)
+            C = st.matrix(sign)
+            rows = _row_cliques(PolyMatrix(C), True)
+            for a in range(C.shape[0]):
+                C[a, a] = C[a, a] - prev
+            mult, eqm = _pmi_localize(
+                C, [("scalar", g) for g in local], [g.degree() for g in local],
+                st.eqs, k, rows, None, "all",
+            )
+            multipliers.append(mult)
+            eq_multipliers.append(eqm)
+            cons.append(SOSMatrix(PolyMatrix(C), cliques=rows))
+            continue
+        lhs = lhs - prev
         stage_mult = []
         for g in local:
             sg, Q = sos_poly_variable(L, monomials(L, k - _half(g.degree())))
@@ -407,7 +503,14 @@ def composition_lower_bound(
     empty for the first stage) and the local variable ``x`` (a Polynomial,
     or a list when ``xdims[i] > 1``), and returning the new state as a list
     of numeric Polynomials in those variables. The last map returns a single
-    polynomial. The ranks ``r_i`` are the lengths of the returned states.
+    polynomial, or a symmetric polynomial matrix (``PolyMatrix``, nested
+    lists or a 2-D object array): the result then bounds
+    ``min_x lambda_min(p(x))`` (``sense="max"``: ``max_x lambda_max``), with
+    a Scherer–Hol matrix certificate on the last stage (SL-push: the PMI
+    ``F_n(s, x) - V_{n-1}(s) I`` in the local quadratic module) or on the
+    lifted variable cliques (SL-chord, via :func:`pmi_optimize` with
+    ``var_cliques``). The ranks ``r_i`` are the lengths of the returned
+    states.
 
     Parameters
     ----------
@@ -491,7 +594,7 @@ def _univariate(x, coeffs, basis, interval):
     return out
 
 
-def cp_lower_bound(factors, weights=None, box=1.0, basis="monomial", **kwargs):
+def cp_lower_bound(factors, weights=None, box=1.0, basis="monomial", matrices=None, **kwargs):
     """Bound a low-rank polynomial ``sum_l w_l prod_i f_{l,i}(x_i)`` (LRPOP).
 
     ``factors[i]`` is an array of shape ``(deg_i + 1, r)`` whose column
@@ -502,6 +605,11 @@ def cp_lower_bound(factors, weights=None, box=1.0, basis="monomial", **kwargs):
     arXiv:2512.08394 with ``method="chord"`` (blocks on ``r + 2``
     variables); ``method="push"`` is also accepted. Remaining keyword
     arguments are passed to :func:`composition_lower_bound`.
+
+    With ``matrices`` (a list of ``r`` symmetric ``m x m`` arrays ``A_l``),
+    the objective is the polynomial matrix
+    ``F(x) = sum_l A_l w_l prod_i f_{l,i}(x_i)`` and the result bounds
+    ``min_x lambda_min(F(x))`` (``sense="max"``: ``max_x lambda_max``).
     """
     factors = [[list(row) for row in f] for f in factors]
     n = len(factors)
@@ -510,6 +618,11 @@ def cp_lower_bound(factors, weights=None, box=1.0, basis="monomial", **kwargs):
         raise ValueError("all factors must have the same number of columns (rank)")
     w = [1.0] * r if weights is None else [float(v) for v in weights]
     boxes = _resolve_box(box, n)
+    if matrices is not None:
+        A = [np.asarray(M, dtype=float) for M in matrices]
+        if len(A) != r:
+            raise ValueError("matrices needs one matrix per rank-one term (%d)" % r)
+        m = A[0].shape[0]
 
     def column(i, l):
         return [row[l] for row in factors[i]]
@@ -520,6 +633,17 @@ def cp_lower_bound(factors, weights=None, box=1.0, basis="monomial", **kwargs):
             prev = [Polynomial.constant(x.nvars, w[l]) for l in range(r)] if i == 0 else s
             new = [prev[l] * f[l] for l in range(r)]
             if i == n - 1:
+                if matrices is not None:
+                    return [
+                        [
+                            sum(
+                                (new[l] * float(A[l][a][b]) for l in range(r)),
+                                Polynomial.zero(x.nvars),
+                            )
+                            for b in range(m)
+                        ]
+                        for a in range(m)
+                    ]
                 total = Polynomial.zero(x.nvars)
                 for q in new:
                     total = total + q

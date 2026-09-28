@@ -1,15 +1,20 @@
 # pysparsepmi
 
 Sparse sum-of-squares (SOS) relaxations for **polynomial matrix inequalities
-(PMIs)** in Python, exploiting chordal (correlative/matrix) sparsity and
-term sparsity.
+(PMIs)** in Python, exploiting chordal (correlative/matrix) sparsity, term
+sparsity, and composition / low-rank structure via state lifting.
 
-The methods implemented here are based on:
+The PMI methods implemented here are those of Y. Zheng and G. Fantuzzi and,
+independently, of J. Miller, J. Wang and F. Guo:
 
 - Y. Zheng, G. Fantuzzi, *Sum-of-squares chordal decomposition of polynomial
   matrix inequalities* ([arXiv:2007.11410](https://arxiv.org/pdf/2007.11410)),
 - J. Miller, J. Wang, F. Guo, *Sparse Polynomial Matrix Optimization*
-  ([arXiv:2411.15479](https://arxiv.org/abs/2411.15479)),
+  ([arXiv:2411.15479](https://arxiv.org/abs/2411.15479)).
+
+In addition, we implement the state-lifting methods that L. Balada Gaggioli,
+D. Henrion and M. Korda proposed for polynomial optimization problems (POPs),
+and extend them to matrix-valued objectives:
 
 - L. Balada Gaggioli, D. Henrion, M. Korda, *Global optimization of
   low-rank polynomials* ([arXiv:2512.08394](https://arxiv.org/abs/2512.08394)),
@@ -111,6 +116,16 @@ res = psp.pmi_optimize(F, ineqs=[G, 1 - x2**2], order=2)
 print(res.value, res.cliques, res.block_sizes)
 ```
 
+Equality constraints enter through free polynomial-matrix multipliers, and
+`cs=True` additionally exploits correlative sparsity in the variables: every
+SOS matrix and multiplier is split over the cliques of the chordally extended
+variable graph, on top of the row-clique decomposition of `F`:
+
+```python
+res = psp.pmi_optimize(F, ineqs=[...], eqs=[h], order=2, cs=True)
+res.cliques, res.var_cliques      # row cliques of F, variable cliques
+```
+
 For scalar polynomial optimization with constraints (sparse Lasserre / Waki
 et al.), use `psp.sos_lower_bound(f, ineqs=[...], order=d)`.
 
@@ -178,6 +193,22 @@ psp.cp_lower_bound(factors, box=1.0, basis="bernstein")       # Bernstein coeffi
 psp.tt_lower_bound(cores, box=1.0, order=2, method="push")    # cores[i]: (r_{i-1}, deg+1, r_i)
 ```
 
+**Matrix-valued objectives.** The last map may return a symmetric
+polynomial matrix; the result then bounds `min_x lambda_min(F(x))`
+(`sense="max"`: `max_x lambda_max(F(x))`). SL-push certifies the PMI
+`F_n(s, x) - V_{n-1}(s) I` on the last stage only; SL-chord uses
+`pmi_optimize` with the lifted variable cliques. This extension of the papers
+(which treat scalar objectives) gives valid bounds, but convergence of the
+matrix versions is not claimed. `cp_lower_bound(..., matrices=[A_1, ...])`
+handles `F(x) = sum_l A_l prod_i f_{l,i}(x_i)`.
+
+```python
+# worst-case gain lambda_max(P' P) of P = M(x_1) ... M(x_n), with the
+# symmetric state S_i = M(x_i)' S_{i-1} M(x_i) lifted (3 scalars per stage)
+res = psp.composition_lower_bound([first] + [step] * (n - 2) + [last],
+                                  box=1.0, order=2, sense="max", method="push")
+```
+
 With a `box`, redundant bounds on the states are derived by interval
 arithmetic (as the papers add for convergence) and every state is rescaled by
 its bound (`scale=True`), an exact change of variables that keeps the SDP
@@ -202,11 +233,12 @@ for substitution and variable-space changes.
 | `polyvar(n)` | create `n` polynomial variables |
 | `PolyMatrix([[...]])`, `eye(m, nvars)` | build symmetric polynomial matrices |
 | `p >> 0`, `SOS(p, sparse=True, ts=...)` | scalar SOS constraint with correlative-sparsity basis splitting (optionally term sparsity) |
-| `P >> 0`, `SOSMatrix(P, sparse=True, nu=..., ts=...)` | matrix SOS constraint with chordal clique decomposition (optionally term sparsity) |
+| `P >> 0`, `SOSMatrix(P, sparse=True, nu=..., ts=..., var_cliques=...)` | matrix SOS constraint with chordal clique decomposition (optionally term sparsity, or variable cliques) |
 | `Problem(objective, constraints).solve()` | CVXPY-style problem wrapper |
 | `pmi_optimize(F, ineqs, order=d, ts=..., ts_order=s)` | lower-bound `lambda_min(F)` on a semialgebraic set |
 | `sos_lower_bound(f, ineqs, order=d, ts=..., ts_order=s)` | sparse Lasserre lower bound for scalar polynomials |
 | `sos_lower_bound(f, ineqs, eqs=[...], cliques=...)` | ... with equality constraints and user-given cliques |
+| `pmi_optimize(F, ineqs, eqs=[...], cs=True)` | PMI bound with equalities and correlative sparsity in the variables |
 | `composition_lower_bound(maps, box, method="chord"/"push")` | state-lifting bounds for chained polynomial maps (SL-chord / SL-push) |
 | `cp_lower_bound(factors, ...)`, `tt_lower_bound(cores, ...)` | LRPOP for CP polynomials, state lifting for tensor trains |
 | `chordal_cliques(pattern, order=...)` | maximal cliques of a chordal extension (optional elimination order) |
@@ -221,8 +253,8 @@ Gram-parameterized SOS multipliers, `monomials`, `gram_candidates`,
 **Scope notes.** This package implements *correlative/matrix* (clique)
 sparsity, *term* sparsity (block closure and minimum-degree chordal
 closure) and *state lifting* for composition, tensor-train and CP structure
-(scalar objectives), and provides bounds only (no moment-side solution
-extraction).
+(scalar and matrix-valued objectives), and provides bounds only (no
+moment-side solution extraction).
 
 ## Examples
 
@@ -245,6 +277,10 @@ extraction).
 - `examples/markov_chain_composition.py` — certified upper bounds for a
   controlled two-state Markov chain (arXiv:2604.17563, Sec. 7.1), SL-chord
   versus SL-push, against the closed form `1/2 + 0.9^n/2`.
+- `examples/matrix_product_gain.py` — worst-case gain
+  `max lambda_max(P'P)` of a product of parameter-dependent 2x2 matrices,
+  lifting the symmetric states `S_i = M(x_i)' S_{i-1} M(x_i)` with a
+  matrix-valued last stage (PMI extension of SL-chord / SL-push).
 - `examples/sparse_pop.py` — chained scalar polynomial optimization with
   correlative sparsity (20 variables, cliques of size 2).
 

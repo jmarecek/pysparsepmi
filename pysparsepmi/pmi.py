@@ -54,6 +54,8 @@ class PMIResult:
     actually performed and ``ts_block_sizes[k]`` lists the Gram block sizes
     of constraint ``k`` (``k = 0`` is the certificate itself). For lifted
     (composition) relaxations, ``ranks`` are the state dimensions ``r_i``.
+    For matrix problems with correlative sparsity in the variables,
+    ``cliques`` are the row cliques and ``var_cliques`` the variable cliques.
     """
 
     value: Optional[float]
@@ -68,6 +70,7 @@ class PMIResult:
     ts_block_sizes: Optional[List[List[int]]] = None
     eq_multipliers: Any = field(repr=False, default=None)
     ranks: Optional[List[int]] = None
+    var_cliques: Optional[List[List[int]]] = None
 
 
 def _matrix_localizer(nvars, size, basis, G):
@@ -288,6 +291,10 @@ def pmi_optimize(
     sparse=True,
     nu=0,
     nvars=None,
+    eqs=(),
+    cs=False,
+    var_cliques=None,
+    multiplier_hosts="all",
     ts=None,
     ts_order=None,
     solver="SCS",
@@ -320,6 +327,21 @@ def pmi_optimize(
         Power of the ``(x'x)^nu`` multiplier applied to the certificate
         matrix before chordal decomposition (Theorem 3.4 of the paper).
         Not supported together with ``ts``.
+    eqs : sequence of Polynomial
+        Scalar equality constraints ``h = 0``, entering through free
+        symmetric polynomial-matrix multipliers ``T_h`` (``- h * T_h``).
+    cs : bool
+        Also exploit correlative sparsity in the variables: every SOS matrix
+        and multiplier is split over the maximal cliques of the chordally
+        extended correlative sparsity graph of ``F`` and the constraints
+        (the variables of each monomial of ``F``, and of each constraint,
+        are pairwise adjacent). Combines with the row-clique decomposition.
+    var_cliques : list of lists, optional
+        Explicit variable cliques (implies ``cs``); every constraint should
+        be supported on one of them.
+    multiplier_hosts : {"all", "one"}
+        With variable cliques, give each constraint one multiplier per
+        containing clique, or a single one on the smallest such clique.
     ts : {"block", "MD"}, optional
         Exploit term sparsity (Miller, Wang & Guo, arXiv:2411.15479,
         Section 4; TSSOS's ``TS=`` option). The Gram matrices of the
@@ -358,14 +380,26 @@ def pmi_optimize(
         else max(g.arr[i, j].degree() for i in range(g.shape[0]) for j in range(g.shape[0]))
         for kind, g in norm_ineqs
     ]
-    d_min = max([_half(degF)] + [_half(dg) for dg in deg_ineqs] + [1])
+    eqs = [as_polynomial(h, n) for h in eqs]
+    d_min = max(
+        [_half(degF)]
+        + [_half(dg) for dg in deg_ineqs]
+        + [_half(h.degree()) for h in eqs]
+        + [1]
+    )
     d = d_min if order is None else int(order)
     if d < d_min:
         raise ValueError("order=%d is below the minimum valid order %d" % (d, d_min))
+    if multiplier_hosts not in ("all", "one"):
+        raise ValueError("multiplier_hosts must be 'all' or 'one'")
 
     if ts is not None:
         if nu:
             raise ValueError("nu is not supported together with ts")
+        if eqs or cs or var_cliques is not None:
+            raise NotImplementedError(
+                "eqs, cs and var_cliques are not supported together with ts"
+            )
         return _pmi_optimize_ts(
             F, norm_ineqs, d, ts, ts_order, solver, verbose, solver_kwargs
         )
@@ -379,38 +413,16 @@ def pmi_optimize(
     for i in range(m):
         C[i, i] = C[i, i] - Polynomial.constant(n, t)
 
-    # cliques of the pattern of F - t*I (diagonal is always nonzero)
-    if sparse:
-        pattern = np.eye(m, dtype=int)
-        for i in range(m):
-            for j in range(m):
-                if not F.arr[i, j].is_zero():
-                    pattern[i, j] = 1
-        cliques = chordal_cliques(pattern)
-    else:
-        cliques = [list(range(m))]
+    if var_cliques is None and cs:
+        var_cliques = _pmi_var_cliques(F, norm_ineqs, eqs)
+    elif var_cliques is not None:
+        var_cliques = [sorted(int(v) for v in c) for c in var_cliques]
+    cliques = _row_cliques(F, sparse)
+    multipliers, eq_multipliers = _pmi_localize(
+        C, norm_ineqs, deg_ineqs, eqs, d, cliques, var_cliques, multiplier_hosts
+    )
 
-    multipliers = []
-    for (kind, g), dg in zip(norm_ineqs, deg_ineqs):
-        d_loc = d - _half(dg)
-        basis = monomials(n, d_loc)
-        per_clique = []
-        for C_k in cliques:
-            mk = len(C_k)
-            if kind == "scalar":
-                S, Q = sos_matrix_variable(n, mk, basis)
-                for ii in range(mk):
-                    for jj in range(mk):
-                        C[C_k[ii], C_k[jj]] = C[C_k[ii], C_k[jj]] - g * S[ii, jj]
-            else:
-                S, Q = _matrix_localizer(n, mk, basis, g.arr)
-                for ii in range(mk):
-                    for jj in range(mk):
-                        C[C_k[ii], C_k[jj]] = C[C_k[ii], C_k[jj]] - S[ii, jj]
-            per_clique.append(Q)
-        multipliers.append(per_clique)
-
-    cert = SOSMatrix(PolyMatrix(C), cliques=cliques, nu=nu)
+    cert = SOSMatrix(PolyMatrix(C), cliques=cliques, nu=nu, var_cliques=var_cliques)
     problem = Problem(cp.Maximize(t), [cert])
     problem.solve(solver=solver, verbose=verbose, **solver_kwargs)
     return PMIResult(
@@ -422,7 +434,105 @@ def pmi_optimize(
         problem=problem,
         t=t,
         multipliers=multipliers,
+        eq_multipliers=eq_multipliers,
+        var_cliques=var_cliques,
     )
+
+
+def _row_cliques(F, sparse):
+    """Maximal cliques of the chordally extended pattern of ``F`` (plus I)."""
+    m = F.shape[0]
+    if not sparse:
+        return [list(range(m))]
+    pattern = np.eye(m, dtype=int)
+    for i in range(m):
+        for j in range(m):
+            if not F.arr[i, j].is_zero():
+                pattern[i, j] = 1
+    return chordal_cliques(pattern)
+
+
+def _pmi_var_cliques(F, norm_ineqs, eqs, order=None):
+    """Correlative sparsity cliques of a PMI problem in the variables."""
+    n = F.nvars
+    groups = []
+    for idx in np.ndindex(F.shape):
+        for e in F.arr[idx].terms:
+            groups.append([i for i, ei in enumerate(e) if ei])
+    for kind, g in norm_ineqs:
+        if kind == "scalar":
+            groups.append(g.variables())
+        else:
+            groups.append(sorted(set().union(*(set(q.variables()) for q in g.arr.flat))))
+    for h in eqs:
+        groups.append(h.variables())
+    edges = [(a, b) for grp in groups for a in grp for b in grp if a < b]
+    return chordal_cliques(edges, n=n, order=order)
+
+
+def _pmi_localize(C, norm_ineqs, deg_ineqs, eqs, d, cliques, var_cliques, hosts_mode):
+    """Subtract Scherer–Hol localizing terms and equality multipliers from ``C``.
+
+    ``C`` (an ``m x m`` object array of Polynomials) is modified in place:
+    for every row clique ``C_k`` and every host variable clique, scalar
+    constraints get ``g * S`` (``S`` an SOS matrix), matrix constraints
+    ``<S, G>`` and equalities ``h * T`` (``T`` a free symmetric polynomial
+    matrix). Returns the Gram variables of the inequality multipliers and
+    the coefficient vectors of the equality multipliers.
+    """
+    n = C[0, 0].nvars
+    all_vars = list(range(n))
+
+    def hosts(vars_):
+        if var_cliques is None:
+            return [None]
+        return _hosts(var_cliques, set(vars_), hosts_mode)
+
+    def subtract(Ck, S):
+        mk = len(Ck)
+        for ii in range(mk):
+            for jj in range(mk):
+                C[Ck[ii], Ck[jj]] = C[Ck[ii], Ck[jj]] - S[ii, jj]
+
+    multipliers = []
+    for (kind, g), dg in zip(norm_ineqs, deg_ineqs):
+        d_loc = d - _half(dg)
+        if kind == "scalar":
+            gvars = g.variables()
+        else:
+            gvars = sorted(set().union(*(set(q.variables()) for q in g.arr.flat)))
+        per_clique = []
+        for V in hosts(gvars):
+            basis = monomials(n, d_loc, vars=V if V is not None else all_vars)
+            for C_k in cliques:
+                mk = len(C_k)
+                if kind == "scalar":
+                    S, Q = sos_matrix_variable(n, mk, basis)
+                    subtract(C_k, g * S)
+                else:
+                    S, Q = _matrix_localizer(n, mk, basis, g.arr)
+                    subtract(C_k, S)
+                per_clique.append(Q)
+        multipliers.append(per_clique)
+
+    eq_multipliers = []
+    for h in eqs:
+        per_clique = []
+        for V in hosts(h.variables()):
+            basis = monomials(n, 2 * d - h.degree(), vars=V if V is not None else all_vars)
+            for C_k in cliques:
+                mk = len(C_k)
+                T = np.empty((mk, mk), dtype=object)
+                coeffs = []
+                for ii in range(mk):
+                    for jj in range(ii, mk):
+                        T[ii, jj], c = free_poly_variable(n, basis)
+                        T[jj, ii] = T[ii, jj]
+                        coeffs.append(c)
+                subtract(C_k, T * h)
+                per_clique.append(coeffs)
+        eq_multipliers.append(per_clique)
+    return multipliers, eq_multipliers
 
 
 def sos_lower_bound(

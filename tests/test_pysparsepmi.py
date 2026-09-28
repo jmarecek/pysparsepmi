@@ -408,6 +408,76 @@ def test_tt_matches_vertex_minimum():
     res = psp.tt_lower_bound(cores, box=1.0, order=2, **SOLVER_OPTS)
     assert abs(res.value - brute) < 10 * TOL * max(1.0, abs(brute)), (res.value, brute)
 
+
+# ----------------------------------------------------------------------
+# PMIs with equalities, correlative sparsity, matrix-valued lifting
+# ----------------------------------------------------------------------
+def test_pmi_equality():
+    # eigenvalues of [[x, y], [y, -x]] are +-sqrt(x^2 + y^2) = +-1 on the circle
+    x, y = psp.polyvar(2)
+    res = psp.pmi_optimize([[x, y], [y, -x]], eqs=[x**2 + y**2 - 1], **SOLVER_OPTS)
+    assert abs(res.value + 1.0) < TOL, res.value
+
+
+def test_pmi_correlative_sparsity_matches_dense():
+    n = 5
+    v = psp.polyvar(n)
+    Z = psp.Polynomial.zero(n)
+    F = [
+        [
+            1 + v[i] ** 2 - v[i] if i == j
+            else (v[min(i, j)] * v[max(i, j)] if abs(i - j) == 1 else Z)
+            for j in range(n)
+        ]
+        for i in range(n)
+    ]
+    ineqs = [1 - vi**2 for vi in v]
+    dense = psp.pmi_optimize(F, ineqs=ineqs, order=2, **SOLVER_OPTS)
+    sparse = psp.pmi_optimize(F, ineqs=ineqs, order=2, cs=True, **SOLVER_OPTS)
+    assert sparse.var_cliques == [[i, i + 1] for i in range(n - 1)]
+    assert max(sparse.block_sizes) < max(dense.block_sizes)
+    assert abs(sparse.value - dense.value) < TOL, (sparse.value, dense.value)
+
+
+def test_matrix_cp_lifting():
+    # F = diag(p_1, p_2) with rank-one multilinear p_l: lambda_min = min_l min p_l
+    import itertools
+
+    factors = [
+        np.array([[1.0, -0.5], [0.5, 0.4]]),
+        np.array([[0.2, 1.0], [-0.8, 0.3]]),
+        np.array([[0.6, 0.5], [0.3, -0.5]]),
+        np.array([[-0.4, 0.7], [0.5, 0.2]]),
+    ]
+    A = [np.diag([1.0, 0.0]), np.diag([0.0, 1.0])]
+
+    def p(l, v):
+        return np.prod([factors[i][0, l] + factors[i][1, l] * v[i] for i in range(4)])
+
+    brute = min(p(l, v) for l in range(2) for v in itertools.product([-1, 1], repeat=4))
+    for method in ("chord", "push"):
+        res = psp.cp_lower_bound(
+            factors, box=1.0, order=2, matrices=A, method=method, **SOLVER_OPTS
+        )
+        assert res.value <= brute + TOL, (method, res.value, brute)
+        assert abs(res.value - brute) < 5 * TOL, (method, res.value, brute)
+
+
+def test_matrix_terminal_map_push():
+    # worst-case gain of M(x1) M(x2) M(x3): symmetric states, PMI last stage
+    import sys, os
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
+    import matrix_product_gain as ex
+
+    n = 3
+    samp = ex.sampled_max(n, pts=21)
+    res = psp.composition_lower_bound(
+        [ex.first, ex.step, ex.last], box=1.0, order=2, method="push",
+        sense="max", **SOLVER_OPTS
+    )
+    assert samp - TOL <= res.value <= samp + 0.02, (res.value, samp)
+
 if __name__ == "__main__":
     import sys
     import traceback

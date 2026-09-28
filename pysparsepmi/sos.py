@@ -256,9 +256,20 @@ class SOSMatrix:
     or a minimum-degree chordal closure (``"MD"``), and each of its cliques
     becomes one small PSD block. ``ts_order`` is the sparse order ``s``
     (``None`` iterates to stabilization).
+
+    ``var_cliques`` additionally exploits correlative sparsity in the
+    variables: the certificate becomes
+    ``sum_{k,a} E_k' S_{k,a}(x_{V_a}) E_k`` with one SOS matrix per row
+    clique ``k`` and variable clique ``V_a``, each over monomials in the
+    variables of ``V_a`` only (the matrix analogue of Waki et al.'s scalar
+    construction). ``block_pairs`` then lists the ``(row clique, variable
+    clique)`` of every block.
     """
 
-    def __init__(self, P, sparse=True, nu=0, cliques=None, nvars=None, ts=None, ts_order=None):
+    def __init__(
+        self, P, sparse=True, nu=0, cliques=None, nvars=None, ts=None, ts_order=None,
+        var_cliques=None,
+    ):
         if isinstance(P, Polynomial):
             raise TypeError("use SOS (or p >> 0) for scalar polynomials")
         if not isinstance(P, PolyMatrix):
@@ -267,11 +278,15 @@ class SOSMatrix:
         self.sparse = bool(sparse)
         self.nu = int(nu)
         self.cliques = None if cliques is None else [sorted(c) for c in cliques]
+        self.var_cliques = (
+            None if var_cliques is None else [sorted(c) for c in var_cliques]
+        )
         self.ts = ts
         self.ts_order = ts_order
         self.bases = None
         self.grams = None
         self.blocks = None
+        self.block_pairs = None
 
     @property
     def block_sizes(self):
@@ -431,12 +446,19 @@ def _compile_sos_matrix(con):
                         "PolyMatrix is not symmetric at entry (%d, %d)" % (i, j)
                     )
 
+    if con.var_cliques is not None and con.ts:
+        raise NotImplementedError("var_cliques is not supported together with ts")
+
     if m == 1 and con.cliques is None:
         # scalar case: fall back to correlative (variable) sparsity
-        inner = SOS(P[0, 0], sparse=con.sparse, ts=con.ts, ts_order=con.ts_order)
+        inner = SOS(
+            P[0, 0], sparse=con.sparse, cliques=con.var_cliques, ts=con.ts,
+            ts_order=con.ts_order,
+        )
         out = inner.compile()
         con.cliques = [[0]]
         con.bases, con.grams, con.blocks = inner.bases, inner.grams, inner.blocks
+        con.block_pairs = [([0], V) for V in inner.cliques]
         return out
 
     nonzero = [(i, j) for i in range(m) for j in range(m) if not P[i, j].is_zero()]
@@ -466,18 +488,20 @@ def _compile_sos_matrix(con):
     for i in range(m):
         diag_supp_all.update(P[i, i].terms)
 
+    var_cliques = con.var_cliques if con.var_cliques is not None else [None]
+    con.block_pairs = [(C, V) for C in con.cliques for V in var_cliques]
     bases = []
-    for C in con.cliques:
+    for C, V in con.block_pairs:
         diag_supp = set()
         for i in C:
             diag_supp.update(P[i, i].terms)
-        bases.append(gram_candidates(diag_supp, nvars))
+        bases.append(gram_candidates(diag_supp, nvars, vars=V))
     con.bases = reduce_bases(bases, diag_supp_all)
 
     lhs = {}  # (i, j) i<=j -> {gamma: [exprs]}
     con.grams = []
     con.blocks = []
-    for C, B in zip(con.cliques, con.bases):
+    for (C, _), B in zip(con.block_pairs, con.bases):
         mk, nB = len(C), len(B)
         if nB == 0:
             con.grams.append(None)
